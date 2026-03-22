@@ -1,81 +1,80 @@
-# Deploy and Connect (Codex, VSCode, other LLMs)
+# Deployment and Client Connection (Production)
 
-## 1) Local mode (stdio) - fastest start
-
-Run:
+## 1) Local process (stdio)
 
 ```bash
 cd /mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp
-./scripts/run-local-with-toml.sh ./examples/mobility-api.context.toml
+source .venv/bin/activate
+GOSYSTEM_MCP_TRANSPORT=stdio \
+GOSYSTEM_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp/config.toml \
+python -m gosystem_test_mcp.server
 ```
 
-Codex connection (one-time):
-
-```bash
-codex mcp add gosystem-test-local --env GOSYSTEM_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp/examples/mobility-api.context.toml -- python -m gosystem_test_mcp.server
-```
-
-## 2) Server mode (streamable-http) - multi developers
-
-### Linux server startup
+## 2) Server process (streamable-http)
 
 ```bash
 cd /opt/gosystem-test-mcp
-./scripts/run-http.sh
+GOSYSTEM_MCP_TRANSPORT=streamable-http \
+GOSYSTEM_MCP_HOST=0.0.0.0 \
+GOSYSTEM_MCP_PORT=8000 \
+GOSYSTEM_MCP_PATH=/mcp \
+GOSYSTEM_MCP_CONFIG_TOML=/opt/gosystem-test-mcp/config.toml \
+python -m gosystem_test_mcp.server
 ```
 
-Default endpoint:
+Endpoints:
 
-- `http://<SERVER_IP>:8000/mcp`
+- MCP: `http://<SERVER_IP>:8000/mcp`
+- Health: `http://<SERVER_IP>:8000/health`
 
-Recommended: expose via HTTPS reverse proxy (`examples/nginx.gosystem-test-mcp.conf`).
+## 3) Docker / Dockploy
 
-## 3) Codex CLI connection to remote MCP
+Use `docker-compose.yml` no root do repositorio.
+
+Deploy:
+
+```bash
+docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+```
+
+Rollback por versao de imagem:
+
+```bash
+IMAGE_TAG=build-42 docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+```
+
+## 4) Codex CLI connection
+
+Local stdio:
+
+```bash
+codex mcp add gosystem-test-local \
+  --env GOSYSTEM_MCP_TRANSPORT=stdio \
+  --env GOSYSTEM_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp/config.toml \
+  -- python -m gosystem_test_mcp.server
+```
+
+Remote HTTP:
 
 ```bash
 codex mcp add gosystem-test-remote --url https://mcp.seudominio.com/mcp
 ```
 
-If protected by bearer token:
-
-```bash
-export GOSYSTEM_MCP_BEARER_TOKEN="<token>"
-codex mcp add gosystem-test-remote --url https://mcp.seudominio.com/mcp --bearer-token-env-var GOSYSTEM_MCP_BEARER_TOKEN
-```
-
-## 4) Codex via config.toml (manual)
+## 5) Codex config.toml snippet
 
 ```toml
 [mcp_servers.gosystemTestMcp]
 url = "https://mcp.seudominio.com/mcp"
-# optional when auth is required:
 # bearer_token_env_var = "GOSYSTEM_MCP_BEARER_TOKEN"
 ```
 
-For local stdio:
+## 6) Multi-dev isolation
 
-```toml
-[mcp_servers.gosystemTestMcp]
-command = "C:/Users/samuelv/RiderProjects/gosystem-test-mcp/.venv/Scripts/python.exe"
-args = ["-m", "gosystem_test_mcp.server"]
+Para garantir que cada projeto veja apenas seu contexto, defina no `config.toml`:
 
-[mcp_servers.gosystemTestMcp.env]
-GOSYSTEM_MCP_CONFIG_TOML = "C:/Users/samuelv/RiderProjects/gosystem-test-mcp/examples/mobility-api.context.toml"
-GOSYSTEM_MCP_TRANSPORT = "stdio"
-```
+- `[context].mode = "isolated"`
+- `[context].store_root` compartilhado/persistente
+- `[context].developer_id` por usuario
+- `[context].workspace_id` por janela/workspace
 
-## 5) VSCode + other LLM clients
-
-Any MCP client that supports one of these transports can connect:
-
-- `stdio` (local process launch)
-- `streamable-http` (remote URL)
-
-Use one context TOML per workspace/window and set:
-
-- `project_root`
-- `developer_id`
-- `workspace_id`
-- `store_root`
-
-This guarantees isolated context per developer and per project.
+A memoria RAG e persistida em SQLite por contexto e usada pelas tools `rag_*`.

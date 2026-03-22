@@ -1,0 +1,21 @@
+[server]
+name = "gosystem-test-mcp"
+transport = "streamable-http"
+
+[project]
+# Defina o projeto default se quiser chamar tools sem project_root.
+project_root = "/workspace/projects/default-api"
+
+[context]
+mode = "isolated"
+store_root = "/data/contexts"
+developer_id = "server"
+workspace_id = "default"
+
+[memory]
+# Persistencia local para RAG/token optimization.
+enabled = true
+chunk_chars = 1200
+chunk_overlap_chars = 180
+default_max_chunks = 8
+default_max_chars = 7000

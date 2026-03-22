@@ -17,8 +17,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY assets ./assets
 COPY scripts ./scripts
-COPY examples ./examples
-COPY config.toml.example ./config.toml.example
+COPY config.toml ./config.toml
 
 RUN pip install --no-cache-dir .
 

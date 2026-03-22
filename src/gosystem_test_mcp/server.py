@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -17,12 +18,16 @@ from .core import (
     enforce_changed_coverage,
     generate_tests_for_changes,
     list_context_states,
+    memory_stats,
+    query_memory,
     read_agent_file,
     resolve_context_state,
     run_validation,
     start_test_timer,
     stop_test_timer,
     summarize_metrics,
+    upsert_memory,
+    index_project_memory,
     runtime_settings,
 )
 
@@ -361,6 +366,110 @@ def list_contexts(
 
 
 @mcp.tool()
+def rag_index_context(
+    project_root: str | None = None,
+    include_agents: bool = True,
+    include_metrics: bool = True,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Index project/context state into local RAG memory for low-token long-context retrieval."""
+    resolved_root = _resolve_project_root(project_root, config_toml_path)
+    return index_project_memory(
+        project_root=resolved_root,
+        include_agents=include_agents,
+        include_metrics=include_metrics,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+
+@mcp.tool()
+def rag_upsert_note(
+    source: str,
+    content: str,
+    metadata_json: str = "{}",
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Store or replace a memory source in local SQLite RAG store (isolated by project/context)."""
+    resolved_root = _resolve_project_root(project_root, config_toml_path)
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid metadata_json: {exc.msg}")
+    return upsert_memory(
+        project_root=resolved_root,
+        source=source,
+        content=content,
+        metadata=metadata if isinstance(metadata, dict) else {"value": metadata},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+
+@mcp.tool()
+def rag_query(
+    query: str,
+    max_chunks: int | None = None,
+    max_chars: int | None = None,
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve compact context via local RAG to minimize token usage in external LLMs."""
+    resolved_root = _resolve_project_root(project_root, config_toml_path)
+    return query_memory(
+        project_root=resolved_root,
+        query=query,
+        max_chunks=max_chunks,
+        max_chars=max_chars,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+
+@mcp.tool()
+def rag_stats(
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Get local RAG memory footprint and token estimate for the active project/context."""
+    resolved_root = _resolve_project_root(project_root, config_toml_path)
+    return memory_stats(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+
+@mcp.tool()
 def list_agent_files() -> dict[str, Any]:
     """List available agent markdown files packaged with this MCP server."""
     agents_dir = Path(__file__).resolve().parents[2] / "assets" / "Agents.Testing"
@@ -404,14 +513,14 @@ def main() -> None:
     stateless_http = stateless_http_raw in {"1", "true", "yes", "on"}
     json_response = json_response_raw in {"1", "true", "yes", "on"}
 
-    mcp.run(
-        transport=transport,
-        host=host,
-        port=port,
-        streamable_http_path=path,
-        stateless_http=stateless_http,
-        json_response=json_response,
-    )
+    # FastMCP runtime settings are read from mcp.settings for HTTP transports.
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = path
+    mcp.settings.stateless_http = stateless_http
+    mcp.settings.json_response = json_response
+
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tomllib
 import xml.etree.ElementTree as ET
@@ -50,6 +51,10 @@ TABLE_HEADER = (
 )
 
 DEFAULT_CONFIG_CANDIDATES = ("config.toml", ".gosystem-test-mcp.toml")
+DEFAULT_RAG_CHUNK_CHARS = 1200
+DEFAULT_RAG_OVERLAP_CHARS = 180
+DEFAULT_RAG_MAX_CHUNKS = 8
+DEFAULT_RAG_MAX_CHARS = 7000
 
 
 def _normalize_fs_path(value: str) -> str:
@@ -384,6 +389,16 @@ def _resolve_context(
     }
 
 
+def _ensure_state_dir_writable(state_dir: Path, root: Path, context_key: str) -> Path:
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir
+    except PermissionError:
+        fallback = root / ".ai-test-mcp" / "contexts" / context_key
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def _mcp_state_dir(
     root: Path,
     context_id: str | None = None,
@@ -423,6 +438,532 @@ def _read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, A
     return json.loads(text)
 
 
+def _estimate_tokens(text: str) -> int:
+    # Lightweight heuristic used only for budgeting context payloads.
+    return max(1, math.ceil(len(text) / 4))
+
+
+def _normalize_whitespace(text: str) -> str:
+    compact = re.sub(r"\r\n?", "\n", text or "")
+    compact = re.sub(r"[ \t]+", " ", compact)
+    compact = re.sub(r"\n{3,}", "\n\n", compact)
+    return compact.strip()
+
+
+def _chunk_text(
+    text: str,
+    max_chars: int = DEFAULT_RAG_CHUNK_CHARS,
+    overlap_chars: int = DEFAULT_RAG_OVERLAP_CHARS,
+) -> list[str]:
+    cleaned = _normalize_whitespace(text)
+    if not cleaned:
+        return []
+
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    chunks: list[str] = []
+    start = 0
+    step = max(64, max_chars - max(0, overlap_chars))
+    while start < len(cleaned):
+        end = min(len(cleaned), start + max_chars)
+        snippet = cleaned[start:end].strip()
+        if snippet:
+            chunks.append(snippet)
+        if end >= len(cleaned):
+            break
+        start += step
+    return chunks
+
+
+def _project_key(root: Path) -> str:
+    return sha1(str(root).encode("utf-8")).hexdigest()
+
+
+def _memory_db_path(
+    root: Path,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    resolved_context = _resolve_context(
+        root=root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    state_dir = _ensure_state_dir_writable(
+        state_dir=resolved_context["state_dir"],
+        root=root,
+        context_key=resolved_context["context_key"],
+    )
+    memory_dir = state_dir / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    return memory_dir / "rag-memory.sqlite3"
+
+
+def _connect_memory_db(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+
+def _ensure_memory_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS memory_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_key TEXT NOT NULL,
+            context_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            token_estimate INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_chunks_scope
+        ON memory_chunks(project_key, context_key, source, chunk_index);
+
+        CREATE INDEX IF NOT EXISTS ix_memory_chunks_lookup
+        ON memory_chunks(project_key, context_key, updated_at_utc DESC);
+        """
+    )
+
+
+def _upsert_source_chunks(
+    conn: sqlite3.Connection,
+    project_key: str,
+    context_key: str,
+    source: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+    chunk_chars: int = DEFAULT_RAG_CHUNK_CHARS,
+    chunk_overlap_chars: int = DEFAULT_RAG_OVERLAP_CHARS,
+) -> dict[str, Any]:
+    normalized_source = source.strip()
+    if not normalized_source:
+        raise ValueError("source must not be empty")
+
+    chunks = _chunk_text(content, max_chars=chunk_chars, overlap_chars=chunk_overlap_chars)
+    now = utc_now_iso()
+    meta_json = json.dumps(metadata or {}, ensure_ascii=True, separators=(",", ":"))
+
+    with conn:
+        conn.execute(
+            """
+            DELETE FROM memory_chunks
+            WHERE project_key = ? AND context_key = ? AND source = ?
+            """,
+            (project_key, context_key, normalized_source),
+        )
+
+        for idx, chunk in enumerate(chunks):
+            conn.execute(
+                """
+                INSERT INTO memory_chunks(
+                    project_key, context_key, source, chunk_index, content,
+                    token_estimate, metadata_json, created_at_utc, updated_at_utc
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_key,
+                    context_key,
+                    normalized_source,
+                    idx,
+                    chunk,
+                    _estimate_tokens(chunk),
+                    meta_json,
+                    now,
+                    now,
+                ),
+            )
+
+    return {
+        "source": normalized_source,
+        "chunks": len(chunks),
+        "tokens_estimate": sum(_estimate_tokens(chunk) for chunk in chunks),
+    }
+
+
+def _tokenize_query(text: str) -> list[str]:
+    raw = re.findall(r"[A-Za-z0-9_]{2,}", text.lower())
+    return sorted(set(raw))
+
+
+def _score_chunk(content: str, terms: list[str]) -> int:
+    if not terms:
+        return 1
+    lowered = content.lower()
+    return sum(lowered.count(term) for term in terms)
+
+
+def _memory_scope(
+    root: Path,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    resolved_context = _resolve_context(
+        root=root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    state_dir = _ensure_state_dir_writable(
+        state_dir=resolved_context["state_dir"],
+        root=root,
+        context_key=resolved_context["context_key"],
+    )
+    return {
+        "project_key": _project_key(root),
+        "context_key": resolved_context["context_key"],
+        "state_dir": state_dir,
+        "db_path": _memory_db_path(
+            root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+    }
+
+
+def _coerce_positive_int(value: Any, default: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
+
+
+def _memory_runtime_settings(
+    root: Path,
+    config_toml_path: str | None = None,
+) -> dict[str, int]:
+    settings = _load_toml_settings(project_root=root, config_toml_path=config_toml_path)
+    memory = settings.get("memory", {}) if isinstance(settings, dict) else {}
+    return {
+        "chunk_chars": _coerce_positive_int(memory.get("chunk_chars"), DEFAULT_RAG_CHUNK_CHARS, minimum=256),
+        "chunk_overlap_chars": _coerce_positive_int(
+            memory.get("chunk_overlap_chars"), DEFAULT_RAG_OVERLAP_CHARS, minimum=0
+        ),
+        "default_max_chunks": _coerce_positive_int(
+            memory.get("default_max_chunks"), DEFAULT_RAG_MAX_CHUNKS, minimum=1
+        ),
+        "default_max_chars": _coerce_positive_int(memory.get("default_max_chars"), DEFAULT_RAG_MAX_CHARS, minimum=256),
+    }
+
+
+def upsert_memory(
+    project_root: str,
+    source: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    memory_settings = _memory_runtime_settings(root, config_toml_path=config_toml_path)
+    scope = _memory_scope(
+        root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    with _connect_memory_db(scope["db_path"]) as conn:
+        _ensure_memory_schema(conn)
+        result = _upsert_source_chunks(
+            conn=conn,
+            project_key=scope["project_key"],
+            context_key=scope["context_key"],
+            source=source,
+            content=content,
+            metadata=metadata,
+            chunk_chars=memory_settings["chunk_chars"],
+            chunk_overlap_chars=memory_settings["chunk_overlap_chars"],
+        )
+
+    return {
+        "status": "ok",
+        "project_root": str(root),
+        "context_key": scope["context_key"],
+        "db_path": str(scope["db_path"]),
+        "upserted": result,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
+def index_project_memory(
+    project_root: str,
+    include_agents: bool = True,
+    include_metrics: bool = True,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    memory_settings = _memory_runtime_settings(root, config_toml_path=config_toml_path)
+    scope = _memory_scope(
+        root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    state_dir: Path = scope["state_dir"]
+
+    sources_to_index: list[tuple[str, Path, dict[str, Any]]] = []
+
+    core_state_files = [
+        ("state://project-profile", state_dir / "project-profile.json", {"kind": "state"}),
+        ("state://variables", state_dir / "variables.json", {"kind": "state"}),
+        ("state://context", state_dir / "context.json", {"kind": "state"}),
+    ]
+    sources_to_index.extend(core_state_files)
+
+    if include_metrics:
+        sources_to_index.extend(
+            [
+                ("metrics://test-metrics-log", state_dir / "metrics" / "test-metrics-log.md", {"kind": "metrics"}),
+                ("metrics://ai-savings-report", state_dir / "metrics" / "ai-savings-report.md", {"kind": "metrics"}),
+            ]
+        )
+
+    if include_agents:
+        agents_dir = state_dir / "agents"
+        if agents_dir.exists():
+            for agent_file in sorted(agents_dir.glob("*.md")):
+                sources_to_index.append(
+                    (
+                        f"agent://{agent_file.name}",
+                        agent_file,
+                        {"kind": "agent", "file_name": agent_file.name},
+                    )
+                )
+
+    indexed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    with _connect_memory_db(scope["db_path"]) as conn:
+        _ensure_memory_schema(conn)
+        for source_name, file_path, meta in sources_to_index:
+            if not file_path.exists() or not file_path.is_file():
+                skipped.append({"source": source_name, "reason": "file_not_found"})
+                continue
+            text = _safe_read(file_path)
+            if not text.strip():
+                skipped.append({"source": source_name, "reason": "empty"})
+                continue
+            upsert_result = _upsert_source_chunks(
+                conn=conn,
+                project_key=scope["project_key"],
+                context_key=scope["context_key"],
+                source=source_name,
+                content=text,
+                metadata=meta | {"path": str(file_path)},
+                chunk_chars=memory_settings["chunk_chars"],
+                chunk_overlap_chars=memory_settings["chunk_overlap_chars"],
+            )
+            indexed.append(upsert_result)
+
+    return {
+        "status": "ok",
+        "project_root": str(root),
+        "context_key": scope["context_key"],
+        "db_path": str(scope["db_path"]),
+        "indexed_sources": len(indexed),
+        "indexed": indexed,
+        "skipped": skipped,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
+def query_memory(
+    project_root: str,
+    query: str,
+    max_chunks: int | None = None,
+    max_chars: int | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    memory_settings = _memory_runtime_settings(root, config_toml_path=config_toml_path)
+    max_chunks_resolved = _coerce_positive_int(
+        max_chunks,
+        memory_settings["default_max_chunks"],
+        minimum=1,
+    )
+    max_chars_resolved = _coerce_positive_int(
+        max_chars,
+        memory_settings["default_max_chars"],
+        minimum=256,
+    )
+    scope = _memory_scope(
+        root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    terms = _tokenize_query(query)
+
+    with _connect_memory_db(scope["db_path"]) as conn:
+        _ensure_memory_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT source, chunk_index, content, token_estimate, metadata_json, updated_at_utc
+            FROM memory_chunks
+            WHERE project_key = ? AND context_key = ?
+            ORDER BY updated_at_utc DESC, source ASC, chunk_index ASC
+            """,
+            (scope["project_key"], scope["context_key"]),
+        ).fetchall()
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        score = _score_chunk(str(row["content"]), terms)
+        if terms and score <= 0:
+            continue
+        scored.append(
+            {
+                "source": str(row["source"]),
+                "chunk_index": int(row["chunk_index"]),
+                "content": str(row["content"]),
+                "score": score,
+                "token_estimate": int(row["token_estimate"]),
+                "updated_at_utc": str(row["updated_at_utc"]),
+                "metadata": json.loads(str(row["metadata_json"]) or "{}"),
+            }
+        )
+
+    scored.sort(key=lambda item: (item["score"], item["updated_at_utc"]), reverse=True)
+
+    selected: list[dict[str, Any]] = []
+    used_chars = 0
+    for row in scored:
+        if len(selected) >= max_chunks_resolved:
+            break
+        content = row["content"]
+        new_chars = used_chars + len(content)
+        if selected and new_chars > max_chars_resolved:
+            continue
+        used_chars = new_chars
+        selected.append(row)
+
+    compact_blocks: list[str] = []
+    for row in selected:
+        compact_blocks.append(
+            f"[{row['source']}#{row['chunk_index']}] {row['content']}"
+        )
+    compact_context = "\n\n".join(compact_blocks)
+
+    return {
+        "status": "ok",
+        "query": query,
+        "terms": terms,
+        "project_root": str(root),
+        "context_key": scope["context_key"],
+        "db_path": str(scope["db_path"]),
+        "matched_chunks": len(scored),
+        "selected_chunks": len(selected),
+        "selected_token_estimate": sum(item["token_estimate"] for item in selected),
+        "selected_char_count": len(compact_context),
+        "max_chunks": max_chunks_resolved,
+        "max_chars": max_chars_resolved,
+        "context_compact": compact_context,
+        "results": selected,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
+def memory_stats(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    scope = _memory_scope(
+        root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    with _connect_memory_db(scope["db_path"]) as conn:
+        _ensure_memory_schema(conn)
+        aggregate = conn.execute(
+            """
+            SELECT COUNT(*) AS chunks, COALESCE(SUM(token_estimate), 0) AS tokens
+            FROM memory_chunks
+            WHERE project_key = ? AND context_key = ?
+            """,
+            (scope["project_key"], scope["context_key"]),
+        ).fetchone()
+        by_source = conn.execute(
+            """
+            SELECT source, COUNT(*) AS chunks, COALESCE(SUM(token_estimate), 0) AS tokens
+            FROM memory_chunks
+            WHERE project_key = ? AND context_key = ?
+            GROUP BY source
+            ORDER BY chunks DESC, source ASC
+            """,
+            (scope["project_key"], scope["context_key"]),
+        ).fetchall()
+
+    return {
+        "status": "ok",
+        "project_root": str(root),
+        "context_key": scope["context_key"],
+        "db_path": str(scope["db_path"]),
+        "chunks": int(aggregate["chunks"]) if aggregate else 0,
+        "token_estimate": int(aggregate["tokens"]) if aggregate else 0,
+        "sources": [
+            {
+                "source": str(row["source"]),
+                "chunks": int(row["chunks"]),
+                "token_estimate": int(row["tokens"]),
+            }
+            for row in by_source
+        ],
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
 def _copy_tree(src: Path, dst: Path, overwrite: bool) -> None:
     if dst.exists() and overwrite:
         shutil.rmtree(dst)
@@ -450,8 +991,11 @@ def bootstrap_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
-    state_dir = resolved_context["state_dir"]
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = _ensure_state_dir_writable(
+        state_dir=resolved_context["state_dir"],
+        root=root,
+        context_key=resolved_context["context_key"],
+    )
 
     profile_path = state_dir / "project-profile.json"
     _write_json(profile_path, profile)
@@ -512,6 +1056,17 @@ def bootstrap_project(
         },
     )
 
+    memory_index = index_project_memory(
+        project_root=str(root),
+        include_agents=True,
+        include_metrics=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
     return {
         "status": "ok",
         "project_root": str(root),
@@ -528,6 +1083,11 @@ def bootstrap_project(
         "agents_path": _short(agents_dst, root),
         "metrics_log_path": _short(metrics_log_path, root),
         "savings_report_path": _short(report_path, root),
+        "memory_db_path": memory_index.get("db_path"),
+        "memory_indexed_sources": memory_index.get("indexed_sources"),
+        "memory_token_estimate": sum(
+            int(item.get("tokens_estimate", 0)) for item in memory_index.get("indexed", [])
+        ),
         "detected": profile,
     }
 
@@ -1317,8 +1877,11 @@ def resolve_context_state(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
-    state_dir: Path = resolved["state_dir"]
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = _ensure_state_dir_writable(
+        state_dir=resolved["state_dir"],
+        root=root,
+        context_key=resolved["context_key"],
+    )
 
     return {
         "status": "ok",
@@ -1456,6 +2019,16 @@ def auto_pipeline(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    memory = index_project_memory(
+        project_root=project_root,
+        include_agents=True,
+        include_metrics=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
 
     return {
         "status": "ok" if coverage_gate.get("status") == "ok" else "failed",
@@ -1463,5 +2036,6 @@ def auto_pipeline(
         "changes": changes,
         "generated": generated,
         "coverage_gate": coverage_gate,
+        "memory": memory,
         "generated_at_utc": utc_now_iso(),
     }

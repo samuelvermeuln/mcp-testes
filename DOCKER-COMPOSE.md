@@ -1,68 +1,42 @@
-# Docker Compose (Local + Server)
+# Docker Compose (Production)
 
-> Para Dockploy, use `docker-compose.yml` (nome esperado por padrao da plataforma).
+Dockploy usa `docker-compose.yml` por padrao.
 
-## Local
-
-1. Copie variaveis de ambiente:
+## 1) Preparar ambiente
 
 ```bash
-cp .env.compose.example .env
+cp .env.compose .env
 ```
 
-2. Ajuste `PROJECTS_ROOT` e `MCP_DATA_DIR` no `.env`.
+Revise no `.env`:
 
-3. Suba com build local:
+- `IMAGE_NAME`
+- `IMAGE_TAG`
+- `MCP_PORT`
+- `MCP_DATA_DIR`
+- `PROJECTS_ROOT`
+
+## 2) Subir servico
 
 ```bash
-docker compose up --build -d
+docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
-4. Verifique:
+## 3) Endpoints
+
+- MCP: `http://localhost:8000/mcp`
+- Health: `http://localhost:8000/health`
+
+## 4) Rollback
 
 ```bash
-docker compose ps
+IMAGE_TAG=build-42 docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
-O MCP ficara disponivel em `http://localhost:8000/mcp`.
-Health endpoint: `http://localhost:8000/health` (alias: `/healthz`).
+## 5) Variaveis importantes
 
-## Servidor (imagem vinda do GHCR)
-
-No servidor, rode sem override para evitar build:
-
-```bash
-docker compose -f compose.yaml pull
-docker compose -f compose.yaml up -d --remove-orphans
-```
-
-## Deploy automatico e rollback
-
-- Cada push na `main`/`master` gera tags automaticas no GHCR:
-- `latest`
-- `build-<run_number>`
-- `sha-<commit>`
-- No Dockploy, use `IMAGE_TAG` para escolher a versao.
-
-Exemplo de rollback para `build-42`:
-
-```bash
-IMAGE_TAG=build-42 docker compose -f compose.yaml pull
-IMAGE_TAG=build-42 docker compose -f compose.yaml up -d --remove-orphans
-```
-
-## Variaveis importantes
-
-- `IMAGE_NAME` / `IMAGE_TAG`: imagem publicada no GHCR.
-- `MCP_PORT`: porta publica do servidor.
-- `GOSYSTEM_MCP_PATH`: path MCP HTTP (padrao `/mcp`).
-- `GOSYSTEM_MCP_CONFIG_TOML`: arquivo TOML dentro do container.
-- `PROJECTS_ROOT`: pasta com APIs .NET montadas no container.
-
-## Dockploy healthcheck
-
-Use endpoint HTTP:
-
-- URL: `/health`
-- Metodo: `GET`
-- Status esperado: `200`
+- `IMAGE_NAME` / `IMAGE_TAG`: imagem publicada no GHCR
+- `MCP_PORT`: porta publica do MCP
+- `GOSYSTEM_MCP_PATH`: path HTTP do MCP (`/mcp`)
+- `GOSYSTEM_MCP_CONFIG_TOML`: caminho do TOML no container
+- `PROJECTS_ROOT`: raiz com APIs .NET montadas no container

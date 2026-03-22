@@ -1,8 +1,0 @@
-[project]
-project_root = "C:/Users/samuelv/RiderProjects/gosystem-mobility-api"
-
-[context]
-mode = "isolated"
-store_root = "C:/Users/samuelv/.gosystem-test-mcp/contexts"
-developer_id = "samuel"
-workspace_id = "vscode-mobility-api"
