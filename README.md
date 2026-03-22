@@ -59,18 +59,17 @@ Endpoints:
 
 ## Docker / Dockploy
 
-Arquivos:
-
-- `docker-compose.yml` (arquivo padrao esperado pelo Dockploy)
-- `Dockerfile`
-- `.env.compose`
-
 Rodar:
 
 ```bash
-cp .env.compose .env
 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
+
+Observacoes:
+
+- existe somente `docker-compose.yml` (sem `compose.yaml`/`override` e sem `.env.compose`)
+- o servidor usa volume persistente para dados e para workspace de projetos
+- `project_root` pode ser omitido: o MCP tenta detectar automaticamente em `/workspace/projects`
 
 ## Configuracao (`config.toml`)
 

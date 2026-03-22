@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -85,10 +86,61 @@ def _resolve_project_root(
     if config_project_root:
         return _normalize_fs_path(config_project_root)
 
+    auto_detected = _auto_detect_project_root()
+    if auto_detected:
+        return auto_detected
+
     raise ValueError(
         "project_root was not provided. Set project_root argument, or set "
-        "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml."
+        "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml. "
+        "If running on server, place project(s) under /workspace/projects so auto-detection can resolve."
     )
+
+
+def _auto_detect_project_root() -> str | None:
+    search_roots: list[Path] = []
+
+    configured_workspace = os.getenv("DIGITAL_SOLUTIONS_PROJECTS_ROOT", "").strip()
+    if configured_workspace:
+        search_roots.append(Path(_normalize_fs_path(configured_workspace)).expanduser())
+
+    search_roots.append(Path("/workspace/projects"))
+    search_roots.append(Path.cwd())
+
+    existing_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in search_roots:
+        key = str(root.resolve()) if root.exists() else str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if root.exists() and root.is_dir():
+            existing_roots.append(root.resolve())
+
+    if not existing_roots:
+        return None
+
+    sln_hits: list[Path] = []
+    csproj_hits: list[Path] = []
+    for base in existing_roots:
+        sln_hits.extend(list(base.rglob("*.sln")))
+        csproj_hits.extend(list(base.rglob("*.csproj")))
+
+    sln_parents = sorted({path.parent.resolve() for path in sln_hits if path.is_file()})
+    if len(sln_parents) == 1:
+        return str(sln_parents[0])
+    if len(sln_parents) > 1:
+        counts = Counter(str(path.parent.resolve()) for path in sln_hits if path.is_file())
+        return counts.most_common(1)[0][0]
+
+    csproj_parents = sorted({path.parent.resolve() for path in csproj_hits if path.is_file()})
+    if len(csproj_parents) == 1:
+        return str(csproj_parents[0])
+    if len(csproj_parents) > 1:
+        counts = Counter(str(path.parent.resolve()) for path in csproj_hits if path.is_file())
+        return counts.most_common(1)[0][0]
+
+    return None
 
 
 @mcp.tool()

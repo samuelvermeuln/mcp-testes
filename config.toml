@@ -3,8 +3,8 @@ name = "digital-solutions-test-mcp"
 transport = "streamable-http"
 
 [project]
-# Defina o projeto default se quiser chamar tools sem project_root.
-project_root = "/workspace/projects/default-api"
+# Deixe vazio para auto-deteccao inteligente do projeto.
+project_root = ""
 
 [context]
 mode = "isolated"

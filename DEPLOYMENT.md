@@ -37,6 +37,12 @@ Deploy:
 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
+Sem configuracao por desenvolvedor:
+
+- nao usa `.env.compose`
+- nao usa `compose.yaml`/`compose.override.yaml`
+- auto-detect de projeto habilitado (prioriza `/workspace/projects` quando `project_root` nao e enviado)
+
 Rollback por versao de imagem:
 
 ```bash

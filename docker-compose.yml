@@ -3,23 +3,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${IMAGE_NAME:-ghcr.io/samuelvermeuln/mcp-testes}:${IMAGE_TAG:-latest}
-    container_name: ${CONTAINER_NAME:-digital-solutions-test-mcp}
+    image: ghcr.io/samuelvermeuln/mcp-testes:latest
+    container_name: digital-solutions-test-mcp
     restart: unless-stopped
     ports:
-      - "${MCP_PORT:-8000}:8000"
+      - "8000:8000"
     environment:
-      DIGITAL_SOLUTIONS_MCP_TRANSPORT: ${DIGITAL_SOLUTIONS_MCP_TRANSPORT:-streamable-http}
+      DIGITAL_SOLUTIONS_MCP_TRANSPORT: streamable-http
       DIGITAL_SOLUTIONS_MCP_HOST: 0.0.0.0
       DIGITAL_SOLUTIONS_MCP_PORT: "8000"
-      DIGITAL_SOLUTIONS_MCP_PATH: ${DIGITAL_SOLUTIONS_MCP_PATH:-/mcp}
-      DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP: ${DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP:-true}
-      DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE: ${DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE:-true}
-      DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: ${DIGITAL_SOLUTIONS_MCP_CONFIG_TOML:-/app/config.toml}
-      DIGITAL_SOLUTIONS_PROJECT_ROOT: ${DIGITAL_SOLUTIONS_PROJECT_ROOT:-}
+      DIGITAL_SOLUTIONS_MCP_PATH: /mcp
+      DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP: "true"
+      DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE: "true"
+      DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: /app/config.toml
+      DIGITAL_SOLUTIONS_PROJECTS_ROOT: /workspace/projects
     volumes:
-      - ${MCP_DATA_DIR:-./data}:/data
-      - ${PROJECTS_ROOT:-./projects}:/workspace/projects
+      - digital-solutions-mcp-data:/data
+      - digital-solutions-mcp-projects:/workspace/projects
     healthcheck:
       test:
         [
@@ -32,3 +32,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+volumes:
+  digital-solutions-mcp-data:
+  digital-solutions-mcp-projects:
