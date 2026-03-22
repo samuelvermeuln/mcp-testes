@@ -71,6 +71,7 @@ Observacoes:
 - o servidor usa volume persistente para dados e para workspace de projetos
 - `project_root` pode ser omitido: o MCP tenta detectar automaticamente em `/workspace/projects`
 - o runtime do servidor agora le `config.toml` de verdade para escolher transporte e paths
+- o servidor publicado libera `Host`/`Origin` externos por configuracao para aceitar Claude, Codex e Copilot
 
 ## Configuracao (`config.toml`)
 
@@ -82,6 +83,9 @@ Campos principais:
 - `[server].sse_path`
 - `[server].message_path`
 - `[server].streamable_http_path`
+- `[server.security].enable_dns_rebinding_protection`
+- `[server.security].allowed_hosts`
+- `[server.security].allowed_origins`
 - `[project].project_root`
 - `[context].mode = "isolated"`
 - `[context].store_root`

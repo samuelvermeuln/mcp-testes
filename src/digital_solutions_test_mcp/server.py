@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -90,6 +91,11 @@ async def root_info(_request: Request) -> JSONResponse:
             "service": "digital-solutions-test-mcp",
             "transport": transport,
             "recommended_endpoint": recommended_endpoint,
+            "security": {
+                "dns_rebinding_protection": server_settings["transport_security"].enable_dns_rebinding_protection,
+                "allowed_hosts": server_settings["transport_security"].allowed_hosts,
+                "allowed_origins": server_settings["transport_security"].allowed_origins,
+            },
             "endpoints": {
                 "health": "/health",
                 "healthz": "/healthz",
@@ -121,6 +127,7 @@ def _settings_block(config_toml_path: str | None = None) -> dict[str, Any]:
 def _server_runtime_settings(config_toml_path: str | None = None) -> dict[str, Any]:
     settings = _settings_block(config_toml_path=config_toml_path)
     server_settings = settings.get("server", {}) if isinstance(settings, dict) else {}
+    security_settings = server_settings.get("security", {}) if isinstance(server_settings, dict) else {}
 
     transport = (
         os.getenv("DIGITAL_SOLUTIONS_MCP_TRANSPORT", "").strip().lower()
@@ -161,6 +168,19 @@ def _server_runtime_settings(config_toml_path: str | None = None) -> dict[str, A
         os.getenv("DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE", "").strip() or server_settings.get("json_response"),
         default=True,
     )
+    enable_dns_rebinding_protection = _boolish(
+        os.getenv("DIGITAL_SOLUTIONS_MCP_ENABLE_DNS_REBINDING_PROTECTION", "").strip()
+        or security_settings.get("enable_dns_rebinding_protection"),
+        default=False,
+    )
+    allowed_hosts = _coerce_string_list(
+        os.getenv("DIGITAL_SOLUTIONS_MCP_ALLOWED_HOSTS", "").strip() or security_settings.get("allowed_hosts"),
+        default=["*"],
+    )
+    allowed_origins = _coerce_string_list(
+        os.getenv("DIGITAL_SOLUTIONS_MCP_ALLOWED_ORIGINS", "").strip() or security_settings.get("allowed_origins"),
+        default=["*"],
+    )
 
     try:
         port = int(port_raw)
@@ -176,6 +196,11 @@ def _server_runtime_settings(config_toml_path: str | None = None) -> dict[str, A
         "message_path": message_path or "/messages/",
         "stateless_http": stateless_http,
         "json_response": json_response,
+        "transport_security": TransportSecuritySettings(
+            enable_dns_rebinding_protection=enable_dns_rebinding_protection,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        ),
     }
 
 
@@ -195,6 +220,16 @@ def _split_path_list(raw: str) -> list[str]:
         return []
     parts = re.split(r"[;\n,]+", raw)
     return [item.strip() for item in parts if item.strip()]
+
+
+def _coerce_string_list(value: Any, default: list[str] | None = None) -> list[str]:
+    if value is None:
+        return list(default or [])
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return _split_path_list(str(value))
 
 
 def _resolve_identity(
@@ -1646,6 +1681,7 @@ def main() -> None:
     mcp.settings.message_path = server_settings["message_path"]
     mcp.settings.stateless_http = server_settings["stateless_http"]
     mcp.settings.json_response = server_settings["json_response"]
+    mcp.settings.transport_security = server_settings["transport_security"]
 
     if transport == "sse":
         mcp.run(transport="sse")

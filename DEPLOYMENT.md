@@ -26,6 +26,11 @@ Endpoints:
 - Health: `http://<SERVER_IP>:8000/health`
 - Streamable HTTP opcional: `http://<SERVER_IP>:8000/mcp` se `transport = "streamable-http"` no `config.toml`
 
+Seguranca de host/origin:
+
+- o arquivo `config.toml` libera hosts/origins externos por padrao para evitar `Invalid Host header`
+- se quiser endurecer depois, ajuste `[server.security]` com dominios explicitos
+
 ## 3) Docker / Dockploy
 
 Use `docker-compose.yml` no root do repositorio.

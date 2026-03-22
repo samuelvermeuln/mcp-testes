@@ -9,6 +9,12 @@ streamable_http_path = "/mcp"
 stateless_http = true
 json_response = true
 
+[server.security]
+# Public MCP server: libera conexoes externas de Claude, Codex e Copilot.
+enable_dns_rebinding_protection = false
+allowed_hosts = ["*"]
+allowed_origins = ["*"]
+
 [project]
 # Deixe vazio para auto-deteccao inteligente do projeto.
 project_root = ""
