@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "gosystem-test-mcp": {
+      "command": "C:\\Users\\samuelv\\RiderProjects\\gosystem-test-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "gosystem_test_mcp.server"
+      ],
+      "env": {
+        "GOSYSTEM_MCP_TRANSPORT": "stdio",
+        "GOSYSTEM_MCP_CONFIG_TOML": "C:\\Users\\samuelv\\RiderProjects\\gosystem-test-mcp\\examples\\mobility-api.context.toml"
+      }
+    }
+  }
+}

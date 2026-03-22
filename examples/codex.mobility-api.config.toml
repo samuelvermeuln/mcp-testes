@@ -1,0 +1,7 @@
+[mcp_servers.gosystemTestMcp]
+command = "C:/Users/samuelv/RiderProjects/gosystem-test-mcp/.venv/Scripts/python.exe"
+args = ["-m", "gosystem_test_mcp.server"]
+cwd = "C:/Users/samuelv/RiderProjects/gosystem-test-mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 180.0
+env = { GOSYSTEM_MCP_TRANSPORT = "stdio", GOSYSTEM_MCP_CONFIG_TOML = "C:/Users/samuelv/RiderProjects/gosystem-test-mcp/examples/mobility-api.context.toml" }
