@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .core import (
     auto_pipeline,
@@ -26,6 +28,28 @@ from .core import (
 
 mcp = FastMCP("gosystem-test-mcp", json_response=True)
 WINDOWS_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(_request: Request) -> JSONResponse:
+    """Lightweight health endpoint for container orchestrators."""
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "gosystem-test-mcp",
+        }
+    )
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz_check(_request: Request) -> JSONResponse:
+    """Alias endpoint for tools that prefer /healthz."""
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "gosystem-test-mcp",
+        }
+    )
 
 
 def _normalize_fs_path(value: str) -> str:

@@ -172,6 +172,7 @@ docker compose up --build -d
 ```
 
 MCP HTTP: `http://localhost:8000/mcp`
+Health HTTP: `http://localhost:8000/health`
 
 ## CI/CD GitHub Actions
 

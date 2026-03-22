@@ -23,6 +23,7 @@ docker compose ps
 ```
 
 O MCP ficara disponivel em `http://localhost:8000/mcp`.
+Health endpoint: `http://localhost:8000/health` (alias: `/healthz`).
 
 ## Servidor (imagem vinda do GHCR)
 
@@ -55,3 +56,11 @@ IMAGE_TAG=build-42 docker compose -f compose.yaml up -d --remove-orphans
 - `GOSYSTEM_MCP_PATH`: path MCP HTTP (padrao `/mcp`).
 - `GOSYSTEM_MCP_CONFIG_TOML`: arquivo TOML dentro do container.
 - `PROJECTS_ROOT`: pasta com APIs .NET montadas no container.
+
+## Dockploy healthcheck
+
+Use endpoint HTTP:
+
+- URL: `/health`
+- Metodo: `GET`
+- Status esperado: `200`
