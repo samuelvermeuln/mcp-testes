@@ -1,5 +1,7 @@
 # Docker Compose (Local + Server)
 
+> Para Dockploy, use `docker-compose.yml` (nome esperado por padrao da plataforma).
+
 ## Local
 
 1. Copie variaveis de ambiente:

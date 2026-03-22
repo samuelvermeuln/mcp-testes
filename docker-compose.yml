@@ -1,0 +1,34 @@
+services:
+  gosystem-test-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${IMAGE_NAME:-ghcr.io/samuelvermeuln/mcp-testes}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-gosystem-test-mcp}
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      GOSYSTEM_MCP_TRANSPORT: ${GOSYSTEM_MCP_TRANSPORT:-streamable-http}
+      GOSYSTEM_MCP_HOST: 0.0.0.0
+      GOSYSTEM_MCP_PORT: "8000"
+      GOSYSTEM_MCP_PATH: ${GOSYSTEM_MCP_PATH:-/mcp}
+      GOSYSTEM_MCP_STATELESS_HTTP: ${GOSYSTEM_MCP_STATELESS_HTTP:-true}
+      GOSYSTEM_MCP_JSON_RESPONSE: ${GOSYSTEM_MCP_JSON_RESPONSE:-true}
+      GOSYSTEM_MCP_CONFIG_TOML: ${GOSYSTEM_MCP_CONFIG_TOML:-/data/config.toml}
+      GOSYSTEM_PROJECT_ROOT: ${GOSYSTEM_PROJECT_ROOT:-}
+    volumes:
+      - ${MCP_DATA_DIR:-./data}:/data
+      - ${PROJECTS_ROOT:-./projects}:/workspace/projects
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); assert data.get('status')=='ok'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

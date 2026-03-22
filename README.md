@@ -159,6 +159,7 @@ O servidor aplica gate de cobertura por arquivo alterado. Para garantia efetiva 
 Arquivos adicionados para containerizacao:
 
 - `Dockerfile`
+- `docker-compose.yml` (compatibilidade direta com Dockploy)
 - `compose.yaml`
 - `compose.override.yaml`
 - `.env.compose.example`
