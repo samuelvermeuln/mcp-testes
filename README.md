@@ -115,6 +115,8 @@ Contexto e memoria:
 - `detect_project`
 - `bootstrap`
 - `bootstrap_with_context`
+- `ingest_project_snapshot`
+- `prepare_test_generation_context`
 - `resolve_context`
 - `list_contexts`
 - `get_runtime_settings`
@@ -140,10 +142,11 @@ Memoria/RAG (token optimization):
 ## Fluxo recomendado para baixo consumo de token
 
 1. `route_project` (passar `intent` e IDs de contexto/dev/workspace)
-2. `rag_query` com pergunta objetiva antes de chamar a LLM externa
-3. usar `context_compact` retornado no prompt da LLM
-4. apos mudancas importantes, chamar `rag_index_context` novamente
-5. ao trocar de API, chamar `route_project` novamente com novo `intent`
+2. se estiver em `context_only`, chamar `bootstrap_with_context` ou `ingest_project_snapshot` com manifesto do projeto, file tree e snapshots das classes/metodos relevantes
+3. chamar `prepare_test_generation_context`
+4. usar `prompt_package` retornado na LLM externa para ela escrever os testes localmente no workspace do dev
+5. apos mudancas importantes, chamar `ingest_project_snapshot` ou `rag_index_context` novamente
+6. ao trocar de API, chamar `route_project` novamente com novo `intent`
 
 ## Selecao inteligente de projeto
 
@@ -161,6 +164,13 @@ Modos de execucao:
 
 - `context_only`: contexto, agentes, bootstrap, RAG e metricas funcionam; tools de codigo exigem que o repositorio seja montado/sincronizado no servidor
 - `server_execution`: o projeto esta visivel no servidor e todas as tools podem operar normalmente
+
+Fluxo remoto sem mount:
+
+- `route_project`
+- `bootstrap_with_context` com `project_manifest_json` e `source_snapshot_json`
+- `prepare_test_generation_context`
+- a LLM cliente escreve o arquivo de teste no repo local do desenvolvedor
 
 Variaveis de ambiente do roteador (opcionais):
 

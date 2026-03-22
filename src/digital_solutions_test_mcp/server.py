@@ -982,8 +982,10 @@ def _missing_project_root_message(requested_root: str, config_toml_path: str | N
     return (
         f"Project root not found on the MCP server: {_normalize_fs_path(requested_root)}. "
         "This remote server cannot read the developer local filesystem directly. "
-        "Mount or sync the project into /workspace/projects on the server, or call route_project "
-        "to select one of the projects already visible to the container."
+        "Preferred remote flow: call route_project, then bootstrap_with_context or ingest_project_snapshot, "
+        "then prepare_test_generation_context so the external LLM can write tests locally in the developer workspace. "
+        "Only if you want server-side execution should you mount or sync the project into /workspace/projects on the server, "
+        "or call route_project to select one of the projects already visible to the container."
         f"{discovered_hint}"
     )
 
@@ -1154,8 +1156,11 @@ def _resolve_project_root(
         raise ValueError(
             "project_root was not provided. Set project_root argument, or set "
             "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml. "
-            "If running on server, place project(s) under /workspace/projects so auto-detection can resolve. "
-            "When multiple projects exist, call route_project once with an intent so the MCP can cache selection."
+            "For remote context-only usage, call route_project, then bootstrap_with_context or "
+            "ingest_project_snapshot, then prepare_test_generation_context so the external LLM can write tests "
+            "locally in the developer workspace. If you specifically want server-side execution tools, place "
+            "project(s) under /workspace/projects so auto-detection can resolve. When multiple projects exist, "
+            "call route_project once with an intent so the MCP can cache selection."
         )
 
     logical_root = _ensure_virtual_project_root(
@@ -1184,6 +1189,334 @@ def _auto_detect_project_root(config_toml_path: str | None = None) -> str | None
         return None
 
     return str(candidates[0]["project_root"])
+
+
+def _read_json_file(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        return dict(default or {})
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(default or {})
+    return payload if isinstance(payload, dict) else dict(default or {})
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _parse_json_payload(field_name: str, raw: str, empty_default: Any) -> Any:
+    if not str(raw or "").strip():
+        return empty_default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid {field_name}: {exc.msg}")
+
+
+def _coerce_int_mapping(value: Any, default: dict[str, int]) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return dict(default)
+    payload: dict[str, int] = {}
+    for key, raw in value.items():
+        try:
+            payload[str(key)] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return payload or dict(default)
+
+
+def _context_state_files(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    resolved = resolve_context_state(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    state_dir = Path(resolved["state_dir_absolute"])
+    return {
+        "state": resolved,
+        "state_dir": state_dir,
+        "profile_path": state_dir / "project-profile.json",
+        "variables_path": state_dir / "variables.json",
+        "context_path": state_dir / "context.json",
+    }
+
+
+def _merge_project_manifest(
+    current_profile: dict[str, Any],
+    manifest: dict[str, Any],
+    project_root: str,
+) -> dict[str, Any]:
+    profile = dict(current_profile)
+    profile["project_root"] = project_root
+    profile["project_name"] = (
+        str(manifest.get("project_name", "")).strip()
+        or str(profile.get("project_name", "")).strip()
+        or Path(project_root).name
+    )
+
+    solution_path = str(manifest.get("solution_path", "")).strip() or profile.get("solution_path")
+    all_solutions = _coerce_string_list(manifest.get("all_solutions"), default=_coerce_string_list(profile.get("all_solutions")))
+    if solution_path and solution_path not in all_solutions:
+        all_solutions.insert(0, solution_path)
+    profile["solution_path"] = solution_path or None
+    profile["all_solutions"] = all_solutions
+
+    test_projects = _coerce_string_list(manifest.get("test_projects"), default=_coerce_string_list(profile.get("test_projects")))
+    explicit_test_project = str(
+        manifest.get("test_project_path", "") or manifest.get("default_test_project", "")
+    ).strip()
+    if explicit_test_project and explicit_test_project not in test_projects:
+        test_projects.insert(0, explicit_test_project)
+    profile["test_projects"] = test_projects
+    profile["default_test_project"] = explicit_test_project or (test_projects[0] if test_projects else None)
+
+    app_projects = _coerce_string_list(manifest.get("app_projects"), default=_coerce_string_list(profile.get("app_projects")))
+    profile["app_projects"] = app_projects
+
+    test_frameworks = _coerce_string_list(
+        manifest.get("test_frameworks"),
+        default=_coerce_string_list(profile.get("test_frameworks")),
+    )
+    explicit_framework = str(manifest.get("test_framework", "")).strip()
+    if explicit_framework and explicit_framework not in test_frameworks:
+        test_frameworks.insert(0, explicit_framework)
+    profile["test_frameworks"] = test_frameworks
+
+    target_frameworks = _coerce_string_list(
+        manifest.get("target_frameworks"),
+        default=_coerce_string_list(profile.get("target_frameworks")),
+    )
+    explicit_target = str(manifest.get("dotnet_version", "")).strip()
+    if explicit_target and explicit_target not in target_frameworks:
+        target_frameworks.insert(0, explicit_target)
+    profile["target_frameworks"] = target_frameworks
+
+    coverage_candidates = _coerce_string_list(
+        manifest.get("coverage_settings_candidates"),
+        default=_coerce_string_list(profile.get("coverage_settings_candidates")),
+    )
+    explicit_coverage = str(
+        manifest.get("coverage_settings_path", "") or manifest.get("default_coverage_settings", "")
+    ).strip()
+    if explicit_coverage and explicit_coverage not in coverage_candidates:
+        coverage_candidates.insert(0, explicit_coverage)
+    profile["coverage_settings_candidates"] = coverage_candidates
+    profile["default_coverage_settings"] = explicit_coverage or (
+        coverage_candidates[0] if coverage_candidates else None
+    )
+
+    profile["coverage_targets"] = _coerce_int_mapping(
+        manifest.get("coverage_targets"),
+        default=_coerce_int_mapping(profile.get("coverage_targets"), {"line": 100, "branch": 100}),
+    )
+    profile["metrics_baseline_minutes"] = _coerce_int_mapping(
+        manifest.get("metrics_baseline_minutes"),
+        default=_coerce_int_mapping(profile.get("metrics_baseline_minutes"), {"S": 20, "M": 45, "L": 90}),
+    )
+    profile["server_project_files_found"] = bool(
+        profile.get("all_solutions") or profile.get("test_projects") or profile.get("app_projects")
+    )
+    profile["virtual_project"] = bool(profile.get("virtual_project", False))
+    profile["original_reference"] = profile.get("original_reference")
+    profile["context_bootstrap_mode"] = "manual_context"
+    profile["generated_at_utc"] = _utc_now_iso()
+    return profile
+
+
+def _merge_variables(
+    current_variables: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    variables = dict(current_variables)
+    variables["PROJECT_NAME"] = profile.get("project_name")
+    variables["SOLUTION_PATH"] = profile.get("solution_path")
+    variables["TEST_PROJECT_PATH"] = profile.get("default_test_project")
+    variables["TEST_FRAMEWORK"] = (
+        profile.get("test_frameworks", ["unknown"])[0] if profile.get("test_frameworks") else "unknown"
+    )
+    variables["DOTNET_VERSION"] = (
+        profile.get("target_frameworks", ["unknown"])[0] if profile.get("target_frameworks") else "unknown"
+    )
+    variables["COVERAGE_SETTINGS_PATH"] = profile.get("default_coverage_settings")
+    coverage_targets = profile.get("coverage_targets", {}) if isinstance(profile.get("coverage_targets"), dict) else {}
+    variables["COVERAGE_LINE_TARGET"] = coverage_targets.get("line", 100)
+    variables["COVERAGE_BRANCH_TARGET"] = coverage_targets.get("branch", 100)
+    variables["CONTEXT_ONLY"] = "true" if profile.get("virtual_project") else "false"
+    variables["CONTEXT_BOOTSTRAP_MODE"] = profile.get("context_bootstrap_mode", "detected")
+    variables["MANUAL_CONTEXT_UPDATED_AT_UTC"] = _utc_now_iso()
+    return variables
+
+
+def _snapshot_sources(snapshot_payload: Any) -> list[dict[str, Any]]:
+    if isinstance(snapshot_payload, dict):
+        files = snapshot_payload.get("files", [])
+    elif isinstance(snapshot_payload, list):
+        files = snapshot_payload
+    else:
+        files = []
+
+    entries: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(files):
+        if not isinstance(raw_entry, dict):
+            continue
+        path = str(raw_entry.get("path", "") or raw_entry.get("name", "") or f"item-{index}").strip()
+        normalized_path = path.replace("\\", "/")
+        metadata = {key: value for key, value in raw_entry.items() if key != "content"}
+        content = str(raw_entry.get("content", "")).rstrip()
+        summary = str(raw_entry.get("summary", "")).strip()
+
+        body_parts = [f"PATH: {normalized_path or f'item-{index}'}"]
+        if metadata.get("kind"):
+            body_parts.append(f"KIND: {metadata['kind']}")
+        if "changed" in metadata:
+            body_parts.append(f"CHANGED: {metadata['changed']}")
+        if summary:
+            body_parts.extend(["", "SUMMARY:", summary])
+        if content:
+            body_parts.extend(["", "CONTENT:", content])
+        elif metadata:
+            body_parts.extend(["", "METADATA:", json.dumps(metadata, indent=2, ensure_ascii=True)])
+
+        entries.append(
+            {
+                "source": f"snapshot://{normalized_path or f'item-{index}'}",
+                "content": "\n".join(body_parts).strip(),
+                "metadata": {
+                    "kind": metadata.get("kind", "snapshot"),
+                    "path": normalized_path or None,
+                    "language": metadata.get("language"),
+                    "changed": metadata.get("changed"),
+                    "symbols": metadata.get("symbols"),
+                },
+            }
+        )
+    return entries
+
+
+def _apply_manual_context(
+    project_root: str,
+    project_manifest_json: str = "{}",
+    source_snapshot_json: str = "{}",
+    file_tree: str = "",
+    notes: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    manifest_payload = _parse_json_payload("project_manifest_json", project_manifest_json, {})
+    snapshot_payload = _parse_json_payload("source_snapshot_json", source_snapshot_json, {})
+    if manifest_payload and not isinstance(manifest_payload, dict):
+        raise ValueError("project_manifest_json must be a JSON object.")
+    if snapshot_payload and not isinstance(snapshot_payload, (dict, list)):
+        raise ValueError("source_snapshot_json must be a JSON object or array.")
+
+    state_files = _context_state_files(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    current_profile = _read_json_file(state_files["profile_path"], default={})
+    current_variables = _read_json_file(state_files["variables_path"], default={})
+
+    merged_profile = _merge_project_manifest(current_profile, manifest_payload if isinstance(manifest_payload, dict) else {}, project_root)
+    merged_variables = _merge_variables(current_variables, merged_profile)
+    _write_json_file(state_files["profile_path"], merged_profile)
+    _write_json_file(state_files["variables_path"], merged_variables)
+
+    upserted_sources: list[str] = []
+
+    manifest_text = json.dumps(manifest_payload if isinstance(manifest_payload, dict) else {}, indent=2, ensure_ascii=True)
+    if str(manifest_text).strip() not in {"{}", ""}:
+        upsert_memory(
+            project_root=project_root,
+            source="context://project-manifest",
+            content=manifest_text,
+            metadata={"kind": "project_manifest"},
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        upserted_sources.append("context://project-manifest")
+
+    if str(file_tree).strip():
+        upsert_memory(
+            project_root=project_root,
+            source="context://file-tree",
+            content=str(file_tree).strip(),
+            metadata={"kind": "file_tree"},
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        upserted_sources.append("context://file-tree")
+
+    if str(notes).strip():
+        upsert_memory(
+            project_root=project_root,
+            source="context://manual-notes",
+            content=str(notes).strip(),
+            metadata={"kind": "manual_notes"},
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        upserted_sources.append("context://manual-notes")
+
+    for entry in _snapshot_sources(snapshot_payload):
+        upsert_memory(
+            project_root=project_root,
+            source=entry["source"],
+            content=entry["content"],
+            metadata=entry["metadata"],
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        upserted_sources.append(entry["source"])
+
+    memory_index = index_project_memory(
+        project_root=project_root,
+        include_agents=True,
+        include_metrics=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    return {
+        "updated_profile": merged_profile,
+        "updated_variables": merged_variables,
+        "upserted_sources": upserted_sources,
+        "memory_index": memory_index,
+        "state_dir": str(state_files["state_dir"]),
+    }
 
 
 @mcp.tool()
@@ -1218,9 +1551,10 @@ def detect_project(
         **profile,
         **details,
         "context_only_hint": (
-            "This project is currently bound as logical context only. Use bootstrap, rag_query, rag_upsert_note, "
-            "metrics_summary and resolve_context normally, but mount or sync the repository on the MCP server "
-            "before calling discover_test_targets, generate_tests, validate, coverage_gate or pipeline."
+            "This project is currently bound as logical context only. Preferred remote flow: bootstrap_with_context "
+            "or ingest_project_snapshot, then prepare_test_generation_context so the external LLM can write tests "
+            "locally in the developer workspace. Only the server-execution tools "
+            "(discover_test_targets, generate_tests, validate, coverage_gate, pipeline) require the repository to be visible on the MCP server."
             if not details["server_files_available"]
             else None
         ),
@@ -1338,9 +1672,10 @@ def route_project(
                 diagnostics["candidate_count"] = 0
                 diagnostics["context_only_mode"] = True
                 diagnostics["message"] = (
-                    "Remote MCP is running in context-only mode for this project. Context, agents, metrics and RAG "
-                    "remain available, but code generation/validation tools require the repository to be mounted or "
-                    "synced on the server."
+                    "Remote MCP is running in context-only mode for this project. Use bootstrap_with_context or "
+                    "ingest_project_snapshot to send project metadata/source snapshots, then call "
+                    "prepare_test_generation_context so the external LLM can write tests locally. "
+                    "Only the server-execution tools require the repository to be mounted or synced on the server."
                 )
                 binding_variables.update(
                     {
@@ -1508,13 +1843,17 @@ def bootstrap(
 def bootstrap_with_context(
     project_root: str | None = None,
     overwrite_agents: bool = False,
+    project_manifest_json: str = "{}",
+    source_snapshot_json: str = "{}",
+    file_tree: str = "",
+    notes: str = "",
     context_id: str | None = None,
     developer_id: str | None = None,
     workspace_id: str | None = None,
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Initialize project context using TOML/env context settings for multi-window and multi-developer isolation."""
+    """Initialize context and optionally ingest a project snapshot so the LLM can generate tests locally without server filesystem access."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -1523,7 +1862,7 @@ def bootstrap_with_context(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
-    return bootstrap_project(
+    bootstrapped = bootstrap_project(
         project_root=resolved_root,
         overwrite_agents=overwrite_agents,
         context_id=context_id,
@@ -1532,6 +1871,214 @@ def bootstrap_with_context(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    manual_context = _apply_manual_context(
+        project_root=resolved_root,
+        project_manifest_json=project_manifest_json,
+        source_snapshot_json=source_snapshot_json,
+        file_tree=file_tree,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    return {
+        **bootstrapped,
+        "manual_context_ingested": bool(
+            manual_context["upserted_sources"]
+            or str(project_manifest_json).strip() not in {"", "{}"}
+            or str(file_tree).strip()
+            or str(notes).strip()
+        ),
+        "manual_context": manual_context,
+        "next_recommended_tool": "prepare_test_generation_context",
+    }
+
+
+@mcp.tool()
+def ingest_project_snapshot(
+    project_root: str | None = None,
+    project_manifest_json: str = "{}",
+    source_snapshot_json: str = "{}",
+    file_tree: str = "",
+    notes: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Ingest remote project metadata/source snapshots into context + RAG so the client LLM can generate tests locally."""
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    _ensure_context_materialized(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    manual_context = _apply_manual_context(
+        project_root=resolved_root,
+        project_manifest_json=project_manifest_json,
+        source_snapshot_json=source_snapshot_json,
+        file_tree=file_tree,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        "execution_mode": "context_only",
+        "upserted_sources_count": len(manual_context["upserted_sources"]),
+        "upserted_sources": manual_context["upserted_sources"],
+        "memory_index": manual_context["memory_index"],
+        "state_dir": manual_context["state_dir"],
+        "next_recommended_tool": "prepare_test_generation_context",
+    }
+
+
+@mcp.tool()
+def prepare_test_generation_context(
+    objective: str,
+    class_name: str = "",
+    method_name: str = "",
+    file_path: str = "",
+    max_chunks: int | None = None,
+    max_chars: int | None = None,
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Prepare a compact prompt package for an external LLM to write/update test files locally in the developer workspace."""
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    _ensure_context_materialized(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
+    state_files = _context_state_files(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    profile = _read_json_file(state_files["profile_path"], default={})
+    variables = _read_json_file(state_files["variables_path"], default={})
+
+    query_parts = [
+        objective,
+        class_name,
+        method_name,
+        file_path,
+        str(profile.get("project_name", "")).strip(),
+        "csharp dotnet tests xunit mocks coverage testing rules",
+    ]
+    query_text = " | ".join([part for part in query_parts if str(part).strip()])
+    rag_payload = query_memory(
+        project_root=resolved_root,
+        query=query_text,
+        max_chunks=max_chunks,
+        max_chars=max_chars,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    target_test_project = str(
+        variables.get("TEST_PROJECT_PATH", "") or profile.get("default_test_project", "")
+    ).strip()
+    prompt_lines = [
+        "You are writing or updating C# tests in the developer local workspace.",
+        f"Execution mode: {details['execution_mode']}.",
+        "Do not ask the MCP server to mount or access the repository when execution mode is context_only.",
+        "Use the project profile, retrieved context and packaged testing agents below.",
+        "",
+        f"Objective: {objective}",
+    ]
+    if class_name:
+        prompt_lines.append(f"Focus class: {class_name}")
+    if method_name:
+        prompt_lines.append(f"Focus method: {method_name}")
+    if file_path:
+        prompt_lines.append(f"Focus file: {file_path}")
+    if target_test_project:
+        prompt_lines.append(f"Target test project hint: {target_test_project}")
+    prompt_lines.extend(
+        [
+            "",
+            "Project profile:",
+            json.dumps(
+                {
+                    "project_name": profile.get("project_name"),
+                    "solution_path": profile.get("solution_path"),
+                    "default_test_project": profile.get("default_test_project"),
+                    "test_frameworks": profile.get("test_frameworks"),
+                    "target_frameworks": profile.get("target_frameworks"),
+                    "coverage_targets": profile.get("coverage_targets"),
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            "",
+            "Retrieved context:",
+            rag_payload.get("context_compact", ""),
+            "",
+            "Expected output:",
+            "- produce complete test file content ready to be saved locally",
+            "- respect xUnit naming and project test standards from the retrieved agent context",
+            "- if context is incomplete, say exactly which class/method/file snapshot is missing instead of asking for server mounts",
+        ]
+    )
+
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        **details,
+        "objective": objective,
+        "query_used": query_text,
+        "target_test_project_hint": target_test_project or None,
+        "prompt_package": "\n".join(prompt_lines).strip(),
+        "rag": rag_payload,
+        "next_action": "Send prompt_package to the external LLM so it can write the test file locally.",
+    }
 
 
 @mcp.tool()
@@ -1545,7 +2092,7 @@ def discover_test_targets(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Inspect changed C# source files and map candidate classes/methods that need tests."""
+    """Inspect changed C# source files and map candidate classes/methods that need tests. Requires server_execution mode."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -1573,7 +2120,7 @@ def generate_tests(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Generate baseline xUnit tests for changed public classes/methods."""
+    """Generate baseline xUnit tests for changed public classes/methods. Requires server_execution mode."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -1601,7 +2148,7 @@ def validate(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Run dotnet build/test and optional coverage collection for the project."""
+    """Run dotnet build/test and optional coverage collection for the project. Requires server_execution mode."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -1634,7 +2181,7 @@ def coverage_gate(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Fail when changed files are below minimum line coverage."""
+    """Fail when changed files are below minimum line coverage. Requires server_execution mode."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -1667,7 +2214,7 @@ def pipeline(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Run bootstrap + discovery + generation + coverage gate in a single call."""
+    """Run bootstrap + discovery + generation + coverage gate in a single call. Requires server_execution mode."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,

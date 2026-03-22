@@ -36,6 +36,13 @@ Modos de operacao:
 - `context_only`: o cliente conecta no MCP remoto para obter regras, agentes, RAG, memoria e metricas sem expor o repo do dev ao servidor
 - `server_execution`: alem do contexto, o servidor enxerga o repositorio montado e pode rodar deteccao de mudancas, gerar testes, validar build/teste e coverage
 
+Fluxo recomendado para `context_only`:
+
+- `route_project`
+- `bootstrap_with_context` ou `ingest_project_snapshot` enviando manifesto, file tree e snapshots das classes/metodos relevantes
+- `prepare_test_generation_context`
+- a LLM cliente escreve/edita os testes localmente no workspace do desenvolvedor
+
 ## 3) Docker / Dockploy
 
 Use `docker-compose.yml` no root do repositorio.
