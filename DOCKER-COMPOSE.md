@@ -33,6 +33,18 @@ docker compose -f compose.yaml pull
 docker compose -f compose.yaml up -d --remove-orphans
 ```
 
+## Deploy por tag e rollback
+
+- Cada `git tag` enviada para o GitHub gera uma imagem com a mesma tag no GHCR.
+- No Dockploy, use `IMAGE_TAG` para escolher a versao.
+
+Exemplo de rollback para `v1.0.2`:
+
+```bash
+IMAGE_TAG=v1.0.2 docker compose -f compose.yaml pull
+IMAGE_TAG=v1.0.2 docker compose -f compose.yaml up -d --remove-orphans
+```
+
 ## Variaveis importantes
 
 - `IMAGE_NAME` / `IMAGE_TAG`: imagem publicada no GHCR.

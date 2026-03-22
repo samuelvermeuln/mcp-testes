@@ -178,5 +178,12 @@ MCP HTTP: `http://localhost:8000/mcp`
 Workflow: `.github/workflows/ci-cd.yml`
 
 - CI: instala pacote, compila `core.py` e `server.py`, smoke test de import.
-- CD: build/push da imagem no GHCR (`ghcr.io/<owner>/<repo>`).
+- CD: build/push da imagem no GHCR (`ghcr.io/<owner>/<repo>`) quando uma tag e criada.
 - Deploy fica a cargo do Dockploy lendo `compose.yaml`.
+
+Exemplo de release por tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
