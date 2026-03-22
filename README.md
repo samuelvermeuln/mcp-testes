@@ -80,6 +80,12 @@ Campos principais:
 - `[context].store_root`
 - `[context].developer_id`
 - `[context].workspace_id`
+- `[router].prefer_llm`
+- `[router].provider`
+- `[router].model`
+- `[router].resolver_command`
+- `[router].projects_root`
+- `[router].max_candidates`
 - `[memory].chunk_chars`
 - `[memory].chunk_overlap_chars`
 - `[memory].default_max_chunks`
@@ -89,6 +95,9 @@ Campos principais:
 
 Core de testes:
 
+- `route_project` (resolve projeto por intent e fixa contexto ativo)
+- `get_active_project`
+- `clear_active_project`
 - `detect_project`
 - `bootstrap`
 - `bootstrap_with_context`
@@ -113,11 +122,29 @@ Memoria/RAG (token optimization):
 
 ## Fluxo recomendado para baixo consumo de token
 
-1. `bootstrap_with_context`
-2. `rag_index_context`
-3. `rag_query` com pergunta objetiva antes de chamar a LLM externa
-4. usar `context_compact` retornado no prompt da LLM
-5. apos mudancas importantes, chamar `rag_index_context` novamente
+1. `route_project` (passar `intent` e IDs de contexto/dev/workspace)
+2. `rag_query` com pergunta objetiva antes de chamar a LLM externa
+3. usar `context_compact` retornado no prompt da LLM
+4. apos mudancas importantes, chamar `rag_index_context` novamente
+5. ao trocar de API, chamar `route_project` novamente com novo `intent`
+
+## Selecao inteligente de projeto
+
+- o MCP guarda projeto ativo por identidade (`context_id` ou `developer_id+workspace_id`)
+- na primeira vez, seleciona por:
+  - `project_root` manual (se enviado), ou
+  - LLM (OpenAI/Anthropic/comando externo), ou
+  - fallback heuristico local
+- nas proximas chamadas, reutiliza o projeto em cache
+- se contexto/estado sumir, o MCP recria bootstrap e reindexa RAG automaticamente
+
+Variaveis de ambiente do roteador (opcionais):
+
+- `DIGITAL_SOLUTIONS_ROUTER_PREFER_LLM=true|false`
+- `DIGITAL_SOLUTIONS_ROUTER_PROVIDER=openai|anthropic`
+- `DIGITAL_SOLUTIONS_ROUTER_MODEL=<modelo>`
+- `DIGITAL_SOLUTIONS_ROUTER_COMMAND="<comando externo>"`
+- `DIGITAL_SOLUTIONS_PROJECTS_ROOT=/workspace/projects`
 
 ## Isolamento de contexto
 

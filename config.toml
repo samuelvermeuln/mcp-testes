@@ -12,6 +12,20 @@ store_root = "/data/contexts"
 developer_id = "server"
 workspace_id = "default"
 
+[router]
+# Roteador de projeto: escolhe projeto por intent e mantem binding por contexto/dev/workspace.
+prefer_llm = true
+# provider: "openai", "anthropic" ou vazio para usar fallback heuristico.
+provider = ""
+# Ex.: "gpt-4.1-mini" ou "claude-3-5-haiku-latest"
+model = ""
+# Opcional: comando externo para resolver projeto via LLM (recebe JSON no stdin e retorna JSON no stdout).
+resolver_command = ""
+# Raiz onde os projetos de API ficam montados no servidor.
+projects_root = "/workspace/projects"
+# Limite de candidatos enviados ao roteador para reduzir tokens.
+max_candidates = 40
+
 [memory]
 # Persistencia local para RAG/token optimization.
 enabled = true
