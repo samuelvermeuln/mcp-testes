@@ -11,4 +11,4 @@ if not exist .venv (
 call .venv\Scripts\activate.bat
 uv pip install -e .
 
-gosystem-test-mcp
+digital-solutions-test-mcp

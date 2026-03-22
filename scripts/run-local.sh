@@ -11,4 +11,4 @@ fi
 source .venv/bin/activate
 uv pip install -e .
 
-exec gosystem-test-mcp
+exec digital-solutions-test-mcp

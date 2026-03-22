@@ -31,7 +31,7 @@ from .core import (
     runtime_settings,
 )
 
-mcp = FastMCP("gosystem-test-mcp", json_response=True)
+mcp = FastMCP("digital-solutions-test-mcp", json_response=True)
 WINDOWS_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 
 
@@ -41,7 +41,7 @@ async def health_check(_request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "status": "ok",
-            "service": "gosystem-test-mcp",
+            "service": "digital-solutions-test-mcp",
         }
     )
 
@@ -52,7 +52,7 @@ async def healthz_check(_request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "status": "ok",
-            "service": "gosystem-test-mcp",
+            "service": "digital-solutions-test-mcp",
         }
     )
 
@@ -75,7 +75,7 @@ def _resolve_project_root(
     if project_root and project_root.strip():
         return _normalize_fs_path(project_root)
 
-    env_project_root = os.getenv("GOSYSTEM_PROJECT_ROOT", "").strip()
+    env_project_root = os.getenv("DIGITAL_SOLUTIONS_PROJECT_ROOT", "").strip()
     if env_project_root:
         return _normalize_fs_path(env_project_root)
 
@@ -87,7 +87,7 @@ def _resolve_project_root(
 
     raise ValueError(
         "project_root was not provided. Set project_root argument, or set "
-        "GOSYSTEM_PROJECT_ROOT, or define [project].project_root in config.toml."
+        "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml."
     )
 
 
@@ -494,21 +494,21 @@ def agent_resource(file_name: str) -> str:
 
 
 def main() -> None:
-    transport = os.getenv("GOSYSTEM_MCP_TRANSPORT", "stdio").strip().lower()
+    transport = os.getenv("DIGITAL_SOLUTIONS_MCP_TRANSPORT", "stdio").strip().lower()
     if transport in {"", "stdio"}:
         mcp.run()
         return
 
-    host = os.getenv("GOSYSTEM_MCP_HOST", "0.0.0.0").strip()
-    port_raw = os.getenv("GOSYSTEM_MCP_PORT", "8000").strip()
-    path = os.getenv("GOSYSTEM_MCP_PATH", "/mcp").strip() or "/mcp"
-    stateless_http_raw = os.getenv("GOSYSTEM_MCP_STATELESS_HTTP", "true").strip().lower()
-    json_response_raw = os.getenv("GOSYSTEM_MCP_JSON_RESPONSE", "true").strip().lower()
+    host = os.getenv("DIGITAL_SOLUTIONS_MCP_HOST", "0.0.0.0").strip()
+    port_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_PORT", "8000").strip()
+    path = os.getenv("DIGITAL_SOLUTIONS_MCP_PATH", "/mcp").strip() or "/mcp"
+    stateless_http_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP", "true").strip().lower()
+    json_response_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE", "true").strip().lower()
 
     try:
         port = int(port_raw)
     except ValueError:
-        raise ValueError(f"Invalid GOSYSTEM_MCP_PORT value: {port_raw}")
+        raise ValueError(f"Invalid DIGITAL_SOLUTIONS_MCP_PORT value: {port_raw}")
 
     stateless_http = stateless_http_raw in {"1", "true", "yes", "on"}
     json_response = json_response_raw in {"1", "true", "yes", "on"}

@@ -28,10 +28,10 @@ jobs:
           pip install -e .
 
       - name: Compile source
-        run: python -m py_compile src/gosystem_test_mcp/core.py src/gosystem_test_mcp/server.py
+        run: python -m py_compile src/digital_solutions_test_mcp/core.py src/digital_solutions_test_mcp/server.py
 
       - name: Import smoke check
-        run: python -c "from gosystem_test_mcp.server import mcp; print(mcp.name)"
+        run: python -c "from digital_solutions_test_mcp.server import mcp; print(mcp.name)"
 
   publish_image:
     name: Build and Publish Image (GHCR)

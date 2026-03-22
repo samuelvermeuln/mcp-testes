@@ -1,5 +1,5 @@
 [server]
-name = "gosystem-test-mcp"
+name = "digital-solutions-test-mcp"
 transport = "streamable-http"
 
 [project]

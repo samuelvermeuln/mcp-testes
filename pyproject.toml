@@ -3,19 +3,19 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gosystem-test-mcp"
+name = "digital-solutions-test-mcp"
 version = "1.0.0"
 description = "MCP server for automatic .NET test orchestration, generation, coverage, and AI productivity metrics"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Gosystem" }]
+authors = [{ name = "Digital Solutions" }]
 dependencies = [
   "mcp>=1.12.4",
   "pydantic>=2.8.0"
 ]
 
 [project.scripts]
-gosystem-test-mcp = "gosystem_test_mcp.server:main"
+digital-solutions-test-mcp = "digital_solutions_test_mcp.server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

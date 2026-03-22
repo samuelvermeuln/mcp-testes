@@ -19,7 +19,7 @@ Revise no `.env`:
 ## 2) Subir servico
 
 ```bash
-docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
 ## 3) Endpoints
@@ -30,13 +30,13 @@ docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove
 ## 4) Rollback
 
 ```bash
-IMAGE_TAG=build-42 docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+IMAGE_TAG=build-42 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
 ## 5) Variaveis importantes
 
 - `IMAGE_NAME` / `IMAGE_TAG`: imagem publicada no GHCR
 - `MCP_PORT`: porta publica do MCP
-- `GOSYSTEM_MCP_PATH`: path HTTP do MCP (`/mcp`)
-- `GOSYSTEM_MCP_CONFIG_TOML`: caminho do TOML no container
+- `DIGITAL_SOLUTIONS_MCP_PATH`: path HTTP do MCP (`/mcp`)
+- `DIGITAL_SOLUTIONS_MCP_CONFIG_TOML`: caminho do TOML no container
 - `PROJECTS_ROOT`: raiz com APIs .NET montadas no container

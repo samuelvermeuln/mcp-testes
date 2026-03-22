@@ -3,23 +3,23 @@
 ## 1) Local process (stdio)
 
 ```bash
-cd /mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp
+cd /mnt/c/Users/samuelv/Documents/mcp-testes
 source .venv/bin/activate
-GOSYSTEM_MCP_TRANSPORT=stdio \
-GOSYSTEM_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp/config.toml \
-python -m gosystem_test_mcp.server
+DIGITAL_SOLUTIONS_MCP_TRANSPORT=stdio \
+DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/Documents/mcp-testes/config.toml \
+python -m digital_solutions_test_mcp.server
 ```
 
 ## 2) Server process (streamable-http)
 
 ```bash
-cd /opt/gosystem-test-mcp
-GOSYSTEM_MCP_TRANSPORT=streamable-http \
-GOSYSTEM_MCP_HOST=0.0.0.0 \
-GOSYSTEM_MCP_PORT=8000 \
-GOSYSTEM_MCP_PATH=/mcp \
-GOSYSTEM_MCP_CONFIG_TOML=/opt/gosystem-test-mcp/config.toml \
-python -m gosystem_test_mcp.server
+cd /opt/digital-solutions-test-mcp
+DIGITAL_SOLUTIONS_MCP_TRANSPORT=streamable-http \
+DIGITAL_SOLUTIONS_MCP_HOST=0.0.0.0 \
+DIGITAL_SOLUTIONS_MCP_PORT=8000 \
+DIGITAL_SOLUTIONS_MCP_PATH=/mcp \
+DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/opt/digital-solutions-test-mcp/config.toml \
+python -m digital_solutions_test_mcp.server
 ```
 
 Endpoints:
@@ -34,13 +34,13 @@ Use `docker-compose.yml` no root do repositorio.
 Deploy:
 
 ```bash
-docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
 Rollback por versao de imagem:
 
 ```bash
-IMAGE_TAG=build-42 docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+IMAGE_TAG=build-42 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
 ## 4) Codex CLI connection
@@ -48,24 +48,24 @@ IMAGE_TAG=build-42 docker compose -p gosystem-test-mcp -f docker-compose.yml up 
 Local stdio:
 
 ```bash
-codex mcp add gosystem-test-local \
-  --env GOSYSTEM_MCP_TRANSPORT=stdio \
-  --env GOSYSTEM_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp/config.toml \
-  -- python -m gosystem_test_mcp.server
+codex mcp add digital-solutions-test-local \
+  --env DIGITAL_SOLUTIONS_MCP_TRANSPORT=stdio \
+  --env DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/Documents/mcp-testes/config.toml \
+  -- python -m digital_solutions_test_mcp.server
 ```
 
 Remote HTTP:
 
 ```bash
-codex mcp add gosystem-test-remote --url https://mcp.seudominio.com/mcp
+codex mcp add digital-solutions-test-remote --url https://mcp.seudominio.com/mcp
 ```
 
 ## 5) Codex config.toml snippet
 
 ```toml
-[mcp_servers.gosystemTestMcp]
+[mcp_servers.digitalSolutionsTestMcp]
 url = "https://mcp.seudominio.com/mcp"
-# bearer_token_env_var = "GOSYSTEM_MCP_BEARER_TOKEN"
+# bearer_token_env_var = "DIGITAL_SOLUTIONS_MCP_BEARER_TOKEN"
 ```
 
 ## 6) Multi-dev isolation

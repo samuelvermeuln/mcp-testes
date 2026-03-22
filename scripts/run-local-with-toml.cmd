@@ -13,6 +13,6 @@ uv pip install -e .
 
 set CONFIG_PATH=%1
 if "%CONFIG_PATH%"=="" set CONFIG_PATH=%ROOT_DIR%\config.toml
-set GOSYSTEM_MCP_CONFIG_TOML=%CONFIG_PATH%
+set DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=%CONFIG_PATH%
 
-gosystem-test-mcp
+digital-solutions-test-mcp

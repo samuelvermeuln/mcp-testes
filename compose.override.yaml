@@ -1,6 +1,6 @@
 services:
-  gosystem-test-mcp:
+  digital-solutions-test-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${LOCAL_IMAGE_NAME:-gosystem-test-mcp-local}:${LOCAL_IMAGE_TAG:-dev}
+    image: ${LOCAL_IMAGE_NAME:-digital-solutions-test-mcp-local}:${LOCAL_IMAGE_TAG:-dev}

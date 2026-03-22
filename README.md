@@ -1,4 +1,4 @@
-# Gosystem Test MCP (Production)
+# Digital Solutions Test MCP (Production)
 
 MCP server para automacao de testes .NET com:
 
@@ -17,8 +17,8 @@ MCP server para automacao de testes .NET com:
 
 ## Estrutura
 
-- `src/gosystem_test_mcp/core.py`: motor principal (deteccao, cobertura, metricas, RAG)
-- `src/gosystem_test_mcp/server.py`: servidor MCP e tools
+- `src/digital_solutions_test_mcp/core.py`: motor principal (deteccao, cobertura, metricas, RAG)
+- `src/digital_solutions_test_mcp/server.py`: servidor MCP e tools
 - `assets/Agents.Testing/`: templates e agentes de padrao de testes
 - `config.toml`: configuracao padrao de runtime
 - `docker-compose.yml`: compose padrao para Dockploy
@@ -33,23 +33,23 @@ MCP server para automacao de testes .NET com:
 ## Execucao local (stdio)
 
 ```bash
-cd /mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp
+cd /mnt/c/Users/samuelv/Documents/mcp-testes
 uv venv
 source .venv/bin/activate
 uv pip install -e .
-GOSYSTEM_MCP_TRANSPORT=stdio gosystem-test-mcp
+DIGITAL_SOLUTIONS_MCP_TRANSPORT=stdio digital-solutions-test-mcp
 ```
 
 ## Execucao servidor (HTTP)
 
 ```bash
-cd /mnt/c/Users/samuelv/RiderProjects/gosystem-test-mcp
+cd /mnt/c/Users/samuelv/Documents/mcp-testes
 source .venv/bin/activate
-GOSYSTEM_MCP_TRANSPORT=streamable-http \
-GOSYSTEM_MCP_HOST=0.0.0.0 \
-GOSYSTEM_MCP_PORT=8000 \
-GOSYSTEM_MCP_PATH=/mcp \
-gosystem-test-mcp
+DIGITAL_SOLUTIONS_MCP_TRANSPORT=streamable-http \
+DIGITAL_SOLUTIONS_MCP_HOST=0.0.0.0 \
+DIGITAL_SOLUTIONS_MCP_PORT=8000 \
+DIGITAL_SOLUTIONS_MCP_PATH=/mcp \
+digital-solutions-test-mcp
 ```
 
 Endpoints:
@@ -69,7 +69,7 @@ Rodar:
 
 ```bash
 cp .env.compose .env
-docker compose -p gosystem-test-mcp -f docker-compose.yml up -d --build --remove-orphans
+docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
 ## Configuracao (`config.toml`)

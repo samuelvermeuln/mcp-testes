@@ -5,11 +5,11 @@ import argparse
 import json
 from pathlib import Path
 
-from gosystem_test_mcp.core import bootstrap_project, discover_changes
+from digital_solutions_test_mcp.core import bootstrap_project, discover_changes
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bootstrap gosystem-test-mcp in two or more APIs")
+    parser = argparse.ArgumentParser(description="Bootstrap digital-solutions-test-mcp in two or more APIs")
     parser.add_argument("project_roots", nargs="+", help="Absolute path(s) to API project roots")
     parser.add_argument("--base-ref", default="HEAD~1", help="Git base ref for change detection")
     parser.add_argument(

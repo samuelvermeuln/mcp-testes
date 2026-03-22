@@ -1,19 +1,19 @@
 services:
-  gosystem-test-mcp:
+  digital-solutions-test-mcp:
     image: ${IMAGE_NAME:-ghcr.io/samuelvermeuln/mcp-testes}:${IMAGE_TAG:-latest}
-    container_name: ${CONTAINER_NAME:-gosystem-test-mcp}
+    container_name: ${CONTAINER_NAME:-digital-solutions-test-mcp}
     restart: unless-stopped
     ports:
       - "${MCP_PORT:-8000}:8000"
     environment:
-      GOSYSTEM_MCP_TRANSPORT: ${GOSYSTEM_MCP_TRANSPORT:-streamable-http}
-      GOSYSTEM_MCP_HOST: 0.0.0.0
-      GOSYSTEM_MCP_PORT: "8000"
-      GOSYSTEM_MCP_PATH: ${GOSYSTEM_MCP_PATH:-/mcp}
-      GOSYSTEM_MCP_STATELESS_HTTP: ${GOSYSTEM_MCP_STATELESS_HTTP:-true}
-      GOSYSTEM_MCP_JSON_RESPONSE: ${GOSYSTEM_MCP_JSON_RESPONSE:-true}
-      GOSYSTEM_MCP_CONFIG_TOML: ${GOSYSTEM_MCP_CONFIG_TOML:-/app/config.toml}
-      GOSYSTEM_PROJECT_ROOT: ${GOSYSTEM_PROJECT_ROOT:-}
+      DIGITAL_SOLUTIONS_MCP_TRANSPORT: ${DIGITAL_SOLUTIONS_MCP_TRANSPORT:-streamable-http}
+      DIGITAL_SOLUTIONS_MCP_HOST: 0.0.0.0
+      DIGITAL_SOLUTIONS_MCP_PORT: "8000"
+      DIGITAL_SOLUTIONS_MCP_PATH: ${DIGITAL_SOLUTIONS_MCP_PATH:-/mcp}
+      DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP: ${DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP:-true}
+      DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE: ${DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE:-true}
+      DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: ${DIGITAL_SOLUTIONS_MCP_CONFIG_TOML:-/app/config.toml}
+      DIGITAL_SOLUTIONS_PROJECT_ROOT: ${DIGITAL_SOLUTIONS_PROJECT_ROOT:-}
     volumes:
       - ${MCP_DATA_DIR:-./data}:/data
       - ${PROJECTS_ROOT:-./projects}:/workspace/projects
