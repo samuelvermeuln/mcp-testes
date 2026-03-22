@@ -8,13 +8,9 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    expose:
+      - "8000"
     environment:
-      DIGITAL_SOLUTIONS_MCP_TRANSPORT: streamable-http
-      DIGITAL_SOLUTIONS_MCP_HOST: 0.0.0.0
-      DIGITAL_SOLUTIONS_MCP_PORT: "8000"
-      DIGITAL_SOLUTIONS_MCP_PATH: /mcp
-      DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP: "true"
-      DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE: "true"
       DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: /app/config.toml
       DIGITAL_SOLUTIONS_PROJECTS_ROOT: /workspace/projects
     volumes:

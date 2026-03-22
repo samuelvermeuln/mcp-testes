@@ -1,6 +1,13 @@
 [server]
 name = "digital-solutions-test-mcp"
-transport = "streamable-http"
+transport = "sse"
+host = "0.0.0.0"
+port = 8000
+sse_path = "/sse"
+message_path = "/messages/"
+streamable_http_path = "/mcp"
+stateless_http = true
+json_response = true
 
 [project]
 # Deixe vazio para auto-deteccao inteligente do projeto.

@@ -10,7 +10,9 @@ docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build
 
 ## 2) Endpoints
 
-- MCP: `http://localhost:8000/mcp`
+- Root diagnose: `http://localhost:8000/`
+- MCP SSE: `http://localhost:8000/sse`
+- SSE messages: `http://localhost:8000/messages/`
 - Health: `http://localhost:8000/health`
 
 ## 3) Rollback
@@ -25,3 +27,4 @@ IMAGE_TAG=build-42 docker compose -p digital-solutions-test-mcp -f docker-compos
 - sem `compose.yaml` e sem `compose.override.yaml`
 - o servidor usa volumes nomeados internos para estado e workspace
 - se `project_root` nao for informado, o MCP tenta identificar automaticamente projetos em `/workspace/projects`
+- o compose nao sobrescreve o transporte do `config.toml`; default atual e `sse`

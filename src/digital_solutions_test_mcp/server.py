@@ -72,6 +72,35 @@ async def healthz_check(_request: Request) -> JSONResponse:
     )
 
 
+@mcp.custom_route("/", methods=["GET"], include_in_schema=False)
+async def root_info(_request: Request) -> JSONResponse:
+    """Expose active transport/paths so reverse-proxy checks can discover the MCP endpoint."""
+    server_settings = _server_runtime_settings()
+    transport = server_settings["transport"]
+    recommended_endpoint = (
+        server_settings["sse_path"]
+        if transport == "sse"
+        else server_settings["streamable_http_path"]
+        if transport == "streamable-http"
+        else None
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "digital-solutions-test-mcp",
+            "transport": transport,
+            "recommended_endpoint": recommended_endpoint,
+            "endpoints": {
+                "health": "/health",
+                "healthz": "/healthz",
+                "sse": server_settings["sse_path"],
+                "messages": server_settings["message_path"],
+                "streamable_http": server_settings["streamable_http_path"],
+            },
+        }
+    )
+
+
 def _normalize_fs_path(value: str) -> str:
     raw = (value or "").strip()
     if not raw:
@@ -87,6 +116,67 @@ def _settings_block(config_toml_path: str | None = None) -> dict[str, Any]:
     payload = runtime_settings(project_root=None, config_toml_path=config_toml_path)
     settings = payload.get("settings", {})
     return settings if isinstance(settings, dict) else {}
+
+
+def _server_runtime_settings(config_toml_path: str | None = None) -> dict[str, Any]:
+    settings = _settings_block(config_toml_path=config_toml_path)
+    server_settings = settings.get("server", {}) if isinstance(settings, dict) else {}
+
+    transport = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_TRANSPORT", "").strip().lower()
+        or str(server_settings.get("transport", "")).strip().lower()
+        or "sse"
+    )
+    host = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_HOST", "").strip()
+        or str(server_settings.get("host", "")).strip()
+        or "0.0.0.0"
+    )
+    port_raw = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_PORT", "").strip()
+        or str(server_settings.get("port", "")).strip()
+        or "8000"
+    )
+    streamable_http_path = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_PATH", "").strip()
+        or str(server_settings.get("streamable_http_path", "")).strip()
+        or str(server_settings.get("path", "")).strip()
+        or "/mcp"
+    )
+    sse_path = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_SSE_PATH", "").strip()
+        or str(server_settings.get("sse_path", "")).strip()
+        or "/sse"
+    )
+    message_path = (
+        os.getenv("DIGITAL_SOLUTIONS_MCP_MESSAGE_PATH", "").strip()
+        or str(server_settings.get("message_path", "")).strip()
+        or "/messages/"
+    )
+    stateless_http = _boolish(
+        os.getenv("DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP", "").strip() or server_settings.get("stateless_http"),
+        default=True,
+    )
+    json_response = _boolish(
+        os.getenv("DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE", "").strip() or server_settings.get("json_response"),
+        default=True,
+    )
+
+    try:
+        port = int(port_raw)
+    except ValueError:
+        raise ValueError(f"Invalid MCP port value: {port_raw}")
+
+    return {
+        "transport": transport,
+        "host": host,
+        "port": port,
+        "streamable_http_path": streamable_http_path or "/mcp",
+        "sse_path": sse_path or "/sse",
+        "message_path": message_path or "/messages/",
+        "stateless_http": stateless_http,
+        "json_response": json_response,
+    }
 
 
 def _boolish(value: Any, default: bool = False) -> bool:
@@ -1542,33 +1632,26 @@ def agent_resource(file_name: str) -> str:
 
 
 def main() -> None:
-    transport = os.getenv("DIGITAL_SOLUTIONS_MCP_TRANSPORT", "stdio").strip().lower()
+    server_settings = _server_runtime_settings()
+    transport = server_settings["transport"]
     if transport in {"", "stdio"}:
         mcp.run()
         return
 
-    host = os.getenv("DIGITAL_SOLUTIONS_MCP_HOST", "0.0.0.0").strip()
-    port_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_PORT", "8000").strip()
-    path = os.getenv("DIGITAL_SOLUTIONS_MCP_PATH", "/mcp").strip() or "/mcp"
-    stateless_http_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_STATELESS_HTTP", "true").strip().lower()
-    json_response_raw = os.getenv("DIGITAL_SOLUTIONS_MCP_JSON_RESPONSE", "true").strip().lower()
-
-    try:
-        port = int(port_raw)
-    except ValueError:
-        raise ValueError(f"Invalid DIGITAL_SOLUTIONS_MCP_PORT value: {port_raw}")
-
-    stateless_http = stateless_http_raw in {"1", "true", "yes", "on"}
-    json_response = json_response_raw in {"1", "true", "yes", "on"}
-
     # FastMCP runtime settings are read from mcp.settings for HTTP transports.
-    mcp.settings.host = host
-    mcp.settings.port = port
-    mcp.settings.streamable_http_path = path
-    mcp.settings.stateless_http = stateless_http
-    mcp.settings.json_response = json_response
+    mcp.settings.host = server_settings["host"]
+    mcp.settings.port = server_settings["port"]
+    mcp.settings.streamable_http_path = server_settings["streamable_http_path"]
+    mcp.settings.sse_path = server_settings["sse_path"]
+    mcp.settings.message_path = server_settings["message_path"]
+    mcp.settings.stateless_http = server_settings["stateless_http"]
+    mcp.settings.json_response = server_settings["json_response"]
 
-    mcp.run(transport=transport)
+    if transport == "sse":
+        mcp.run(transport="sse")
+        return
+
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":

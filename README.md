@@ -45,17 +45,17 @@ DIGITAL_SOLUTIONS_MCP_TRANSPORT=stdio digital-solutions-test-mcp
 ```bash
 cd /mnt/c/Users/samuelv/Documents/mcp-testes
 source .venv/bin/activate
-DIGITAL_SOLUTIONS_MCP_TRANSPORT=streamable-http \
-DIGITAL_SOLUTIONS_MCP_HOST=0.0.0.0 \
-DIGITAL_SOLUTIONS_MCP_PORT=8000 \
-DIGITAL_SOLUTIONS_MCP_PATH=/mcp \
+DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/Documents/mcp-testes/config.toml \
 digital-solutions-test-mcp
 ```
 
 Endpoints:
 
-- MCP: `http://<host>:8000/mcp`
+- Root diagnose: `http://<host>:8000/`
+- MCP SSE: `http://<host>:8000/sse`
+- SSE messages: `http://<host>:8000/messages/`
 - Health: `http://<host>:8000/health`
+- Streamable HTTP alternativo: `http://<host>:8000/mcp` se voce trocar `[server].transport` no `config.toml`
 
 ## Docker / Dockploy
 
@@ -70,11 +70,18 @@ Observacoes:
 - existe somente `docker-compose.yml` (sem `compose.yaml`/`override` e sem `.env.compose`)
 - o servidor usa volume persistente para dados e para workspace de projetos
 - `project_root` pode ser omitido: o MCP tenta detectar automaticamente em `/workspace/projects`
+- o runtime do servidor agora le `config.toml` de verdade para escolher transporte e paths
 
 ## Configuracao (`config.toml`)
 
 Campos principais:
 
+- `[server].transport`
+- `[server].host`
+- `[server].port`
+- `[server].sse_path`
+- `[server].message_path`
+- `[server].streamable_http_path`
 - `[project].project_root`
 - `[context].mode = "isolated"`
 - `[context].store_root`
@@ -145,6 +152,17 @@ Variaveis de ambiente do roteador (opcionais):
 - `DIGITAL_SOLUTIONS_ROUTER_MODEL=<modelo>`
 - `DIGITAL_SOLUTIONS_ROUTER_COMMAND="<comando externo>"`
 - `DIGITAL_SOLUTIONS_PROJECTS_ROOT=/workspace/projects`
+
+## Claude Code
+
+Para o Claude Code, o cadastro correto quando o servidor estiver publicado e roteado e:
+
+```bash
+claude mcp remove mcp_solucoes_digitais_testes
+claude mcp add --transport sse --scope user mcp_solucoes_digitais_testes "https://seu-dominio/sse"
+```
+
+Se `https://seu-dominio/health` e `https://seu-dominio/` retornarem `404 page not found`, o erro esta no Traefik/Dokploy e nao no endpoint do MCP.
 
 ## Isolamento de contexto
 

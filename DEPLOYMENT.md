@@ -10,22 +10,21 @@ DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/mnt/c/Users/samuelv/Documents/mcp-testes/conf
 python -m digital_solutions_test_mcp.server
 ```
 
-## 2) Server process (streamable-http)
+## 2) Server process (SSE default)
 
 ```bash
 cd /opt/digital-solutions-test-mcp
-DIGITAL_SOLUTIONS_MCP_TRANSPORT=streamable-http \
-DIGITAL_SOLUTIONS_MCP_HOST=0.0.0.0 \
-DIGITAL_SOLUTIONS_MCP_PORT=8000 \
-DIGITAL_SOLUTIONS_MCP_PATH=/mcp \
 DIGITAL_SOLUTIONS_MCP_CONFIG_TOML=/opt/digital-solutions-test-mcp/config.toml \
 python -m digital_solutions_test_mcp.server
 ```
 
 Endpoints:
 
-- MCP: `http://<SERVER_IP>:8000/mcp`
+- Root diagnose: `http://<SERVER_IP>:8000/`
+- MCP SSE: `http://<SERVER_IP>:8000/sse`
+- SSE messages: `http://<SERVER_IP>:8000/messages/`
 - Health: `http://<SERVER_IP>:8000/health`
+- Streamable HTTP opcional: `http://<SERVER_IP>:8000/mcp` se `transport = "streamable-http"` no `config.toml`
 
 ## 3) Docker / Dockploy
 
@@ -63,18 +62,27 @@ codex mcp add digital-solutions-test-local \
 Remote HTTP:
 
 ```bash
-codex mcp add digital-solutions-test-remote --url https://mcp.seudominio.com/mcp
+codex mcp add digital-solutions-test-remote --url https://mcp.seudominio.com/sse
 ```
 
 ## 5) Codex config.toml snippet
 
 ```toml
 [mcp_servers.digitalSolutionsTestMcp]
-url = "https://mcp.seudominio.com/mcp"
+url = "https://mcp.seudominio.com/sse"
 # bearer_token_env_var = "DIGITAL_SOLUTIONS_MCP_BEARER_TOKEN"
 ```
 
-## 6) Multi-dev isolation
+## 6) Claude Code
+
+```bash
+claude mcp remove mcp_solucoes_digitais_testes
+claude mcp add --transport sse --scope user mcp_solucoes_digitais_testes "https://mcp.seudominio.com/sse"
+```
+
+Se o dominio publicar `404 page not found` em `/health` e `/`, o problema esta no roteamento do Traefik/Dokploy para a porta `8000`.
+
+## 7) Multi-dev isolation
 
 Para garantir que cada projeto veja apenas seu contexto, defina no `config.toml`:
 
