@@ -43,6 +43,12 @@ Fluxo recomendado para `context_only`:
 - `prepare_test_generation_context`
 - a LLM cliente escreve/edita os testes localmente no workspace do desenvolvedor
 
+Sinalizacao para clientes MCP:
+
+- o servidor publica `instructions` com esse fluxo como comportamento padrao
+- o resource `usage://workflow` expõe a mesma orientacao
+- os prompts `context_only_workflow` e `server_execution_workflow` podem ser lidos pelo cliente
+
 ## 3) Docker / Dockploy
 
 Use `docker-compose.yml` no root do repositorio.

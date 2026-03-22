@@ -37,7 +37,30 @@ from .core import (
     runtime_settings,
 )
 
-mcp = FastMCP("digital-solutions-test-mcp", json_response=True)
+SERVER_INSTRUCTIONS = """
+This MCP is optimized for remote multi-developer test orchestration.
+
+Default behavior:
+- Prefer context_only workflow when the repository is not visible on the MCP server.
+- Do not ask the developer to mount the repository as the first response.
+- Do not ask broad open-ended questions when the next tool call is already known.
+
+When execution_mode is context_only:
+1. Call route_project.
+2. Call bootstrap_with_context or ingest_project_snapshot with project_manifest_json, source_snapshot_json, file_tree, and concise notes.
+3. Call prepare_test_generation_context.
+4. Use prompt_package so the external LLM writes the tests locally in the developer workspace.
+
+Only use discover_test_targets, generate_tests, validate, coverage_gate, or pipeline when execution_mode is server_execution or when the user explicitly wants server-side execution.
+
+If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot. Do not ask for Docker mounts unless the user wants server_execution.
+""".strip()
+
+mcp = FastMCP(
+    "digital-solutions-test-mcp",
+    instructions=SERVER_INSTRUCTIONS,
+    json_response=True,
+)
 WINDOWS_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 DEFAULT_ROUTER_CONTEXT_ROOT = "/data/contexts"
 
@@ -49,6 +72,70 @@ def _utc_now_iso() -> str:
 def _slug(value: str, fallback: str = "default") -> str:
     normalized = re.sub(r"[^A-Za-z0-9]+", "-", (value or "").strip()).strip("-").lower()
     return normalized or fallback
+
+
+def _context_only_steps() -> list[dict[str, str]]:
+    return [
+        {
+            "tool": "route_project",
+            "why": "bind the active logical project for this developer/workspace",
+        },
+        {
+            "tool": "bootstrap_with_context",
+            "why": "initialize agents, state and memory while ingesting project manifest and source snapshots",
+        },
+        {
+            "tool": "ingest_project_snapshot",
+            "why": "refresh or append file/class/method snapshots after code changes",
+        },
+        {
+            "tool": "prepare_test_generation_context",
+            "why": "produce a compact prompt_package for the external LLM to write tests locally",
+        },
+    ]
+
+
+def _server_execution_steps() -> list[dict[str, str]]:
+    return [
+        {
+            "tool": "route_project",
+            "why": "bind the active mounted project on the server",
+        },
+        {
+            "tool": "discover_test_targets",
+            "why": "inspect changed source files directly on the server filesystem",
+        },
+        {
+            "tool": "generate_tests",
+            "why": "generate baseline tests directly in the mounted repository",
+        },
+        {
+            "tool": "validate",
+            "why": "run build, tests and optional coverage on the server",
+        },
+    ]
+
+
+def _workflow_guidance_payload(server_files_available: bool) -> dict[str, Any]:
+    if server_files_available:
+        return {
+            "preferred_workflow": "server_execution",
+            "summary": (
+                "The repository is visible to the MCP server. Server-side execution tools may be used."
+            ),
+            "next_actions": _server_execution_steps(),
+            "prompt_name": "server_execution_workflow",
+            "resource_uri": "usage://workflow",
+        }
+    return {
+        "preferred_workflow": "context_only",
+        "summary": (
+            "Preferred flow is remote context-only: ingest snapshots and let the external LLM write tests locally."
+        ),
+        "next_actions": _context_only_steps(),
+        "prompt_name": "context_only_workflow",
+        "resource_uri": "usage://workflow",
+    }
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
@@ -89,6 +176,7 @@ async def root_info(_request: Request) -> JSONResponse:
         {
             "status": "ok",
             "service": "digital-solutions-test-mcp",
+            "instructions_summary": "For remote usage, prefer snapshot/context workflow instead of asking for repository mounts.",
             "transport": transport,
             "recommended_endpoint": recommended_endpoint,
             "security": {
@@ -102,6 +190,15 @@ async def root_info(_request: Request) -> JSONResponse:
                 "sse": server_settings["sse_path"],
                 "messages": server_settings["message_path"],
                 "streamable_http": server_settings["streamable_http_path"],
+            },
+            "workflow": {
+                "resource_uri": "usage://workflow",
+                "prompts": ["context_only_workflow", "server_execution_workflow"],
+                "default_remote_sequence": [
+                    "route_project",
+                    "bootstrap_with_context",
+                    "prepare_test_generation_context",
+                ],
             },
         }
     )
@@ -1546,10 +1643,12 @@ def detect_project(
     )
     profile = detect_project_profile(resolved_root)
     details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
+    workflow = _workflow_guidance_payload(details["server_files_available"])
     return {
         "status": "ok",
         **profile,
         **details,
+        **workflow,
         "context_only_hint": (
             "This project is currently bound as logical context only. Preferred remote flow: bootstrap_with_context "
             "or ingest_project_snapshot, then prepare_test_generation_context so the external LLM can write tests "
@@ -1737,6 +1836,7 @@ def route_project(
         "switched": switched,
         "execution_mode": "server_execution" if binding_variables.get("server_files_available") else "context_only",
         "server_files_available": bool(binding_variables.get("server_files_available")),
+        **_workflow_guidance_payload(bool(binding_variables.get("server_files_available"))),
         "binding": binding,
         "ensure_context": ensure_context,
         "context_materialized": context_payload,
@@ -1768,6 +1868,15 @@ def get_active_project(
             "found": False,
             "identity": identity,
             "message": "No active project binding found for this identity.",
+            "preferred_workflow": "context_only",
+            "next_actions": [
+                {
+                    "tool": "route_project",
+                    "why": "bind a logical or mounted project before requesting test generation guidance",
+                }
+            ],
+            "prompt_name": "context_only_workflow",
+            "resource_uri": "usage://workflow",
         }
 
     root = _normalize_fs_path(str(binding.get("project_root", "")))
@@ -1780,6 +1889,7 @@ def get_active_project(
         "project_root": root,
         "project_exists": exists,
         **details,
+        **_workflow_guidance_payload(details["server_files_available"]),
         "binding": binding,
     }
 
@@ -2077,6 +2187,16 @@ def prepare_test_generation_context(
         "target_test_project_hint": target_test_project or None,
         "prompt_package": "\n".join(prompt_lines).strip(),
         "rag": rag_payload,
+        "next_actions": [
+            {
+                "step": "send_prompt_package",
+                "why": "use the prepared context with the external LLM so it writes the test file locally",
+            },
+            {
+                "step": "refresh_snapshot_after_changes",
+                "why": "call ingest_project_snapshot again if the implementation or target test file changes",
+            },
+        ],
         "next_action": "Send prompt_package to the external LLM so it can write the test file locally.",
     }
 
@@ -2540,6 +2660,56 @@ def rag_stats(
 
 
 @mcp.tool()
+def get_usage_guidance(
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Return the preferred MCP workflow so external LLMs do not ask the developer for repository mounts unnecessarily."""
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    server_files_available = False
+    resolved_root = None
+
+    try:
+        resolved_root = _resolve_project_root(
+            project_root=project_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
+        server_files_available = details["server_files_available"]
+    except Exception:
+        details = {
+            "execution_mode": "context_only",
+            "server_files_available": False,
+            "requested_project_root": _normalize_fs_path(project_root or ""),
+            "resolution": "unresolved",
+        }
+
+    workflow = _workflow_guidance_payload(server_files_available)
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        **details,
+        **workflow,
+        "server_instructions": SERVER_INSTRUCTIONS,
+        "do_not_ask_for_mount_first": True,
+    }
+
+
+@mcp.tool()
 def list_agent_files() -> dict[str, Any]:
     """List available agent markdown files packaged with this MCP server."""
     agents_dir = Path(__file__).resolve().parents[2] / "assets" / "Agents.Testing"
@@ -2555,6 +2725,55 @@ def list_agent_files() -> dict[str, Any]:
 def get_agent_file(file_name: str) -> dict[str, Any]:
     """Read one packaged agent markdown file by name."""
     return read_agent_file(file_name)
+
+
+@mcp.prompt(
+    name="context_only_workflow",
+    title="Context-Only Workflow",
+    description="Use this prompt when the repository is not visible to the MCP server and tests must be written locally by the external LLM.",
+)
+def context_only_workflow_prompt(objective: str = "") -> list[str]:
+    prompt_lines = [
+        "Use the context-only workflow for this MCP.",
+        "Do not ask the developer to mount the repository as the first step.",
+        "Do not ask broad open-ended questions.",
+        "Call these tools in order:",
+        "1. route_project",
+        "2. bootstrap_with_context or ingest_project_snapshot",
+        "3. prepare_test_generation_context",
+        "Then use prompt_package so the external LLM writes the test file locally in the developer workspace.",
+        "If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot.",
+    ]
+    if objective.strip():
+        prompt_lines.extend(["", f"Current objective: {objective.strip()}"])
+    return ["\n".join(prompt_lines)]
+
+
+@mcp.prompt(
+    name="server_execution_workflow",
+    title="Server Execution Workflow",
+    description="Use this prompt when the repository is mounted on the MCP server and server-side generation/validation tools may run directly.",
+)
+def server_execution_workflow_prompt(objective: str = "") -> list[str]:
+    prompt_lines = [
+        "Use the server-execution workflow for this MCP.",
+        "The repository is visible to the MCP server, so direct generation and validation tools may be used.",
+        "Recommended sequence:",
+        "1. route_project",
+        "2. discover_test_targets",
+        "3. generate_tests",
+        "4. validate",
+        "5. coverage_gate or pipeline when appropriate",
+    ]
+    if objective.strip():
+        prompt_lines.extend(["", f"Current objective: {objective.strip()}"])
+    return ["\n".join(prompt_lines)]
+
+
+@mcp.resource("usage://workflow")
+def workflow_resource() -> str:
+    """Expose the preferred MCP workflow instructions as a resource for clients."""
+    return SERVER_INSTRUCTIONS
 
 
 @mcp.resource("agent://{file_name}")

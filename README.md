@@ -117,6 +117,7 @@ Contexto e memoria:
 - `bootstrap_with_context`
 - `ingest_project_snapshot`
 - `prepare_test_generation_context`
+- `get_usage_guidance`
 - `resolve_context`
 - `list_contexts`
 - `get_runtime_settings`
@@ -171,6 +172,13 @@ Fluxo remoto sem mount:
 - `bootstrap_with_context` com `project_manifest_json` e `source_snapshot_json`
 - `prepare_test_generation_context`
 - a LLM cliente escreve o arquivo de teste no repo local do desenvolvedor
+
+Sinalizacao automatica para a LLM:
+
+- o MCP agora publica `instructions` nativas do servidor com o fluxo preferido
+- expose o resource `usage://workflow`
+- registra os prompts `context_only_workflow` e `server_execution_workflow`
+- `detect_project`, `route_project` e `get_active_project` retornam `preferred_workflow` e `next_actions`
 
 Variaveis de ambiente do roteador (opcionais):
 
