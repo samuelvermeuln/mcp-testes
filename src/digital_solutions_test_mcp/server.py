@@ -838,6 +838,55 @@ def _ensure_context_materialized(
     }
 
 
+def _resolve_project_root_from_candidates(
+    requested_root: str,
+    config_toml_path: str | None = None,
+) -> str | None:
+    normalized = _normalize_fs_path(requested_root)
+    if not normalized:
+        return None
+
+    normalized_path = Path(normalized)
+    if normalized_path.exists():
+        return str(normalized_path.resolve())
+
+    candidates = _discover_project_candidates(config_toml_path=config_toml_path)
+    if not candidates:
+        return None
+
+    normalized_parts = [part.lower() for part in normalized_path.parts if part]
+    normalized_name = normalized_path.name.lower()
+
+    exact_name_matches = [item for item in candidates if str(item["project_name"]).lower() == normalized_name]
+    if len(exact_name_matches) == 1:
+        return str(exact_name_matches[0]["project_root"])
+
+    suffix_matches: list[dict[str, Any]] = []
+    for item in candidates:
+        candidate_parts = [part.lower() for part in Path(str(item["project_root"])).parts if part]
+        if normalized_parts and len(candidate_parts) >= len(normalized_parts):
+            if candidate_parts[-len(normalized_parts) :] == normalized_parts:
+                suffix_matches.append(item)
+
+    if len(suffix_matches) == 1:
+        return str(suffix_matches[0]["project_root"])
+
+    return None
+
+
+def _missing_project_root_message(requested_root: str, config_toml_path: str | None = None) -> str:
+    candidates = _discover_project_candidates(config_toml_path=config_toml_path)
+    discovered_names = ", ".join(sorted(str(item["project_name"]) for item in candidates[:8]))
+    discovered_hint = f" Visible server projects: {discovered_names}." if discovered_names else ""
+    return (
+        f"Project root not found on the MCP server: {_normalize_fs_path(requested_root)}. "
+        "This remote server cannot read the developer local filesystem directly. "
+        "Mount or sync the project into /workspace/projects on the server, or call route_project "
+        "to select one of the projects already visible to the container."
+        f"{discovered_hint}"
+    )
+
+
 def _resolve_project_root(
     project_root: str | None = None,
     context_id: str | None = None,
@@ -846,15 +895,21 @@ def _resolve_project_root(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> str:
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
     if project_root and project_root.strip():
         resolved = _normalize_fs_path(project_root)
-        identity = _resolve_identity(
-            context_id=context_id,
-            developer_id=developer_id,
-            workspace_id=workspace_id,
-            context_root=context_root,
-            config_toml_path=config_toml_path,
-        )
+        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
+        if remapped:
+            resolved = remapped
+        elif not Path(resolved).exists():
+            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
         _set_active_binding(
             identity=identity,
             project_root=resolved,
@@ -867,13 +922,11 @@ def _resolve_project_root(
     env_project_root = os.getenv("DIGITAL_SOLUTIONS_PROJECT_ROOT", "").strip()
     if env_project_root:
         resolved = _normalize_fs_path(env_project_root)
-        identity = _resolve_identity(
-            context_id=context_id,
-            developer_id=developer_id,
-            workspace_id=workspace_id,
-            context_root=context_root,
-            config_toml_path=config_toml_path,
-        )
+        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
+        if remapped:
+            resolved = remapped
+        elif not Path(resolved).exists():
+            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
         _set_active_binding(
             identity=identity,
             project_root=resolved,
@@ -883,24 +936,23 @@ def _resolve_project_root(
         )
         return resolved
 
-    identity = _resolve_identity(
-        context_id=context_id,
-        developer_id=developer_id,
-        workspace_id=workspace_id,
-        context_root=context_root,
-        config_toml_path=config_toml_path,
-    )
     active_binding = _get_active_binding(identity)
     if active_binding:
         active_root = _normalize_fs_path(str(active_binding.get("project_root", "")).strip())
-        if active_root and Path(active_root).exists():
-            return active_root
+        remapped = _resolve_project_root_from_candidates(active_root, config_toml_path=config_toml_path)
+        if remapped:
+            return remapped
 
     settings_payload = runtime_settings(project_root=None, config_toml_path=config_toml_path)
     project_settings = settings_payload.get("settings", {}).get("project", {})
     config_project_root = str(project_settings.get("project_root", "")).strip()
     if config_project_root:
         resolved = _normalize_fs_path(config_project_root)
+        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
+        if remapped:
+            resolved = remapped
+        elif not Path(resolved).exists():
+            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
         _set_active_binding(
             identity=identity,
             project_root=resolved,
@@ -960,6 +1012,21 @@ def detect_project(
 
 
 @mcp.tool()
+def list_visible_projects(
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """List .NET projects currently visible to the MCP container/server."""
+    candidates = _discover_project_candidates(config_toml_path=config_toml_path)
+    return {
+        "status": "ok",
+        "projects_found": len(candidates),
+        "projects": candidates,
+        "search_roots": [str(path) for path in _router_search_roots(config_toml_path=config_toml_path)],
+        "generated_at_utc": _utc_now_iso(),
+    }
+
+
+@mcp.tool()
 def route_project(
     intent: str = "",
     project_root: str | None = None,
@@ -991,6 +1058,11 @@ def route_project(
 
     if project_root and project_root.strip():
         resolved_root = _normalize_fs_path(project_root)
+        remapped = _resolve_project_root_from_candidates(resolved_root, config_toml_path=config_toml_path)
+        if remapped:
+            resolved_root = remapped
+        elif not Path(resolved_root).exists():
+            raise FileNotFoundError(_missing_project_root_message(resolved_root, config_toml_path=config_toml_path))
         selected_by = "manual"
         selection_reason = "manual project_root provided"
     else:
@@ -1009,8 +1081,9 @@ def route_project(
             candidates = _discover_project_candidates(config_toml_path=config_toml_path)
             if not candidates:
                 raise ValueError(
-                    "No .NET projects found. Mount projects under /workspace/projects or set "
-                    "DIGITAL_SOLUTIONS_PROJECTS_ROOT."
+                    "No .NET projects found on the MCP server. A remote MCP cannot read the developer local "
+                    "filesystem directly. Mount or sync project folders under /workspace/projects, or set "
+                    "DIGITAL_SOLUTIONS_PROJECTS_ROOT to a server-side directory that contains the APIs."
                 )
 
             selected, method, resolver_diag = _select_project_with_llm_or_heuristic(
@@ -1481,17 +1554,18 @@ def get_runtime_settings(
 ) -> dict[str, Any]:
     """Load effective TOML runtime settings used by the MCP server."""
     resolved_root = None
-    if project_root is not None or _get_active_binding(
-        _resolve_identity(
-            context_id=context_id,
-            developer_id=developer_id,
-            workspace_id=workspace_id,
-            context_root=context_root,
-            config_toml_path=config_toml_path,
-        )
-    ):
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    if project_root is not None:
+        resolved_root = _normalize_fs_path(project_root)
+    elif _get_active_binding(identity):
         resolved_root = _resolve_project_root(
-            project_root=project_root,
+            project_root=None,
             context_id=context_id,
             developer_id=developer_id,
             workspace_id=workspace_id,

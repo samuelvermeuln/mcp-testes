@@ -107,6 +107,7 @@ Campos principais:
 Core de testes:
 
 - `route_project` (resolve projeto por intent e fixa contexto ativo)
+- `list_visible_projects`
 - `get_active_project`
 - `clear_active_project`
 - `detect_project`
@@ -142,6 +143,7 @@ Memoria/RAG (token optimization):
 ## Selecao inteligente de projeto
 
 - o MCP guarda projeto ativo por identidade (`context_id` ou `developer_id+workspace_id`)
+- quando recebe um path do cliente que nao existe no servidor, tenta casar pelo nome do projeto ja montado em `/workspace/projects`
 - na primeira vez, seleciona por:
   - `project_root` manual (se enviado), ou
   - LLM (OpenAI/Anthropic/comando externo), ou

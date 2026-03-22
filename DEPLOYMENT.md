@@ -50,6 +50,7 @@ Sem configuracao por desenvolvedor:
 - nao usa `.env.compose`
 - nao usa `compose.yaml`/`compose.override.yaml`
 - auto-detect de projeto habilitado (prioriza `/workspace/projects` quando `project_root` nao e enviado)
+- paths Windows/Linux enviados pelo cliente podem ser remapeados para um projeto visivel no servidor pelo nome da pasta
 
 Rollback por versao de imagem:
 
