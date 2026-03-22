@@ -1,5 +1,6 @@
 services:
-  digital-solutions-test-mcp:
+  # Compatibilidade com o app atual do Dokploy, que ainda referencia este service name.
+  gosystem-test-mcp:
     build:
       context: .
       dockerfile: Dockerfile
