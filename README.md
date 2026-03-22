@@ -179,4 +179,4 @@ Workflow: `.github/workflows/ci-cd.yml`
 
 - CI: instala pacote, compila `core.py` e `server.py`, smoke test de import.
 - CD: build/push da imagem no GHCR (`ghcr.io/<owner>/<repo>`).
-- Deploy opcional via SSH + Docker Compose, habilitado por secrets.
+- Deploy fica a cargo do Dockploy lendo `compose.yaml`.
