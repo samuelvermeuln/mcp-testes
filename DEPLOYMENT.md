@@ -36,6 +36,9 @@ Deploy:
 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
+No Dokploy/Traefik, a rota publica precisa apontar para a porta interna `8000` do servico `digital-solutions-test-mcp`.
+Se o dominio responder `404 page not found` em `/` e `/health`, o proxy ainda nao esta encaminhando para o container.
+
 Sem configuracao por desenvolvedor:
 
 - nao usa `.env.compose`
