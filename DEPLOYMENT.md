@@ -52,6 +52,11 @@ Rollback por versao de imagem:
 IMAGE_TAG=build-42 docker compose -p digital-solutions-test-mcp -f docker-compose.yml up -d --build --remove-orphans
 ```
 
+Tags de release:
+
+- cada push em `main`/`master` cria automaticamente uma nova tag semantica no GitHub
+- isso permite rollback por tag anterior no repositorio, alem das tags de imagem no GHCR
+
 ## 4) Codex CLI connection
 
 Local stdio:

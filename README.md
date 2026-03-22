@@ -174,5 +174,6 @@ Com `context.mode = "isolated"`, cada projeto/workspace/dev enxerga apenas seu p
 Workflow: `.github/workflows/ci-cd.yml`
 
 - CI em PR/push
+- push em `main`/`master` cria automaticamente uma nova tag semantica (`v1.0.0`, `v1.0.1`, ...)
 - build/push de imagem em push para `main`/`master`
 - tags de imagem automaticas: `latest`, `build-<run_number>`, `sha-<commit>`

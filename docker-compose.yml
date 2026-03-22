@@ -1,34 +1,42 @@
+x-mcp-service: &mcp_service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ghcr.io/samuelvermeuln/mcp-testes:latest
+  container_name: digital-solutions-test-mcp
+  restart: unless-stopped
+  ports:
+    - "8000:8000"
+  expose:
+    - "8000"
+  environment:
+    DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: /app/config.toml
+    DIGITAL_SOLUTIONS_PROJECTS_ROOT: /workspace/projects
+  volumes:
+    - digital-solutions-mcp-data:/data
+    - digital-solutions-mcp-projects:/workspace/projects
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "python3",
+        "-c",
+        "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); assert data.get('status')=='ok'",
+      ]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
 services:
-  # Compatibilidade com o app atual do Dokploy, que ainda referencia este service name.
+  digital-solutions-test-mcp:
+    <<: *mcp_service
+
+  # Compatibilidade com apps antigos do Dokploy que ainda validam este service name.
   gosystem-test-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ghcr.io/samuelvermeuln/mcp-testes:latest
-    container_name: digital-solutions-test-mcp
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    expose:
-      - "8000"
-    environment:
-      DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: /app/config.toml
-      DIGITAL_SOLUTIONS_PROJECTS_ROOT: /workspace/projects
-    volumes:
-      - digital-solutions-mcp-data:/data
-      - digital-solutions-mcp-projects:/workspace/projects
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python3",
-          "-c",
-          "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); assert data.get('status')=='ok'",
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+    <<: *mcp_service
+    profiles:
+      - legacy-dokploy
 
 volumes:
   digital-solutions-mcp-data:

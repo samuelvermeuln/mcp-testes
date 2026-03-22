@@ -33,10 +33,52 @@ jobs:
       - name: Import smoke check
         run: python -c "from digital_solutions_test_mcp.server import mcp; print(mcp.name)"
 
+  create_release_tag:
+    name: Create Release Tag
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.bump_tag.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create next semantic tag
+        id: bump_tag
+        run: |
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+
+          if [ -z "$latest_tag" ]; then
+            next_tag="v1.0.0"
+          else
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$version"
+            major="${major:-1}"
+            minor="${minor:-0}"
+            patch="${patch:-0}"
+            next_tag="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          git tag -a "$next_tag" -m "Release $next_tag"
+          git push origin "$next_tag"
+          echo "release_tag=$next_tag" >> "$GITHUB_OUTPUT"
+
   publish_image:
     name: Build and Publish Image (GHCR)
     runs-on: ubuntu-latest
-    needs: ci
+    needs:
+      - ci
+      - create_release_tag
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: read
@@ -66,6 +108,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=raw,value=build-${{ github.run_number }}
+            type=raw,value=${{ needs.create_release_tag.outputs.release_tag }}
             type=sha
 
       - name: Build and push image
