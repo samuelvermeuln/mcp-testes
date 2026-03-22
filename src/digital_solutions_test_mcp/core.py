@@ -218,6 +218,7 @@ def detect_project_profile(project_root: str) -> dict[str, Any]:
 
     solutions = _iter_files(root, ".sln")
     csprojs = _iter_files(root, ".csproj")
+    reference_metadata = _project_reference_metadata(root)
 
     test_projects: list[Path] = []
     app_projects: list[Path] = []
@@ -256,6 +257,9 @@ def detect_project_profile(project_root: str) -> dict[str, Any]:
             "line": 100,
             "branch": 100,
         },
+        "server_project_files_found": bool(solutions or csprojs),
+        "virtual_project": bool(reference_metadata.get("virtual_project", False)),
+        "original_reference": reference_metadata.get("original_reference"),
         "metrics_baseline_minutes": {
             "S": 20,
             "M": 45,
@@ -436,6 +440,14 @@ def _read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, A
     if not text.strip():
         return {} if default is None else default
     return json.loads(text)
+
+
+def _project_reference_metadata(root: Path) -> dict[str, Any]:
+    metadata_path = root / ".ai-test-mcp" / "project-reference.json"
+    if not metadata_path.exists() or not metadata_path.is_file():
+        return {}
+    payload = _read_json(metadata_path, default={})
+    return payload if isinstance(payload, dict) else {}
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1088,6 +1100,7 @@ def bootstrap_project(
         "memory_token_estimate": sum(
             int(item.get("tokens_estimate", 0)) for item in memory_index.get("indexed", [])
         ),
+        "execution_mode": "context_only" if bool(profile.get("virtual_project")) else "server_execution",
         "detected": profile,
     }
 

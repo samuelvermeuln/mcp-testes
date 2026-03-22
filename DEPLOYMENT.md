@@ -31,6 +31,11 @@ Seguranca de host/origin:
 - o arquivo `config.toml` libera hosts/origins externos por padrao para evitar `Invalid Host header`
 - se quiser endurecer depois, ajuste `[server.security]` com dominios explicitos
 
+Modos de operacao:
+
+- `context_only`: o cliente conecta no MCP remoto para obter regras, agentes, RAG, memoria e metricas sem expor o repo do dev ao servidor
+- `server_execution`: alem do contexto, o servidor enxerga o repositorio montado e pode rodar deteccao de mudancas, gerar testes, validar build/teste e coverage
+
 ## 3) Docker / Dockploy
 
 Use `docker-compose.yml` no root do repositorio.
@@ -51,6 +56,8 @@ Sem configuracao por desenvolvedor:
 - nao usa `compose.yaml`/`compose.override.yaml`
 - auto-detect de projeto habilitado (prioriza `/workspace/projects` quando `project_root` nao e enviado)
 - paths Windows/Linux enviados pelo cliente podem ser remapeados para um projeto visivel no servidor pelo nome da pasta
+- se nenhum projeto estiver montado, `route_project` cria um projeto logico isolado para manter contexto e RAG; para tools de execucao, continue montando/sincronizando o repo em `/workspace/projects`
+- em ambiente local sem permissao de escrita em `/data`, o MCP usa fallback automatico para `.ai-test-mcp/_projects`
 
 Rollback por versao de imagem:
 

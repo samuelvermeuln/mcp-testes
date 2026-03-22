@@ -14,6 +14,7 @@ MCP server para automacao de testes .NET com:
 - persistencia local: memoria RAG em SQLite no estado do contexto
 - baixo acoplamento de cliente: qualquer LLM com MCP pode conectar
 - payload compacto: `rag_query` retorna contexto filtrado por relevancia e budget
+- modo hibrido: o mesmo MCP pode operar como `context_only` remoto ou `server_execution` quando o repositorio esta visivel no servidor
 
 ## Estrutura
 
@@ -70,6 +71,7 @@ Observacoes:
 - existe somente `docker-compose.yml` (sem `compose.yaml`/`override` e sem `.env.compose`)
 - o servidor usa volume persistente para dados e para workspace de projetos
 - `project_root` pode ser omitido: o MCP tenta detectar automaticamente em `/workspace/projects`
+- quando nenhum projeto .NET estiver visivel no servidor, `route_project` cria um projeto logico e mantem contexto, agentes, metricas e RAG sem depender do filesystem local do dev
 - o runtime do servidor agora le `config.toml` de verdade para escolher transporte e paths
 - o servidor publicado libera `Host`/`Origin` externos por configuracao para aceitar Claude, Codex e Copilot
 
@@ -104,7 +106,7 @@ Campos principais:
 
 ## Tools MCP
 
-Core de testes:
+Contexto e memoria:
 
 - `route_project` (resolve projeto por intent e fixa contexto ativo)
 - `list_visible_projects`
@@ -113,17 +115,20 @@ Core de testes:
 - `detect_project`
 - `bootstrap`
 - `bootstrap_with_context`
+- `resolve_context`
+- `list_contexts`
+- `get_runtime_settings`
+- `start_timer`
+- `stop_timer`
+- `metrics_summary`
+
+Execucao em repositorio visivel no servidor:
+
 - `discover_test_targets`
 - `generate_tests`
 - `validate`
 - `coverage_gate`
 - `pipeline`
-- `start_timer`
-- `stop_timer`
-- `metrics_summary`
-- `resolve_context`
-- `list_contexts`
-- `get_runtime_settings`
 
 Memoria/RAG (token optimization):
 
@@ -144,12 +149,18 @@ Memoria/RAG (token optimization):
 
 - o MCP guarda projeto ativo por identidade (`context_id` ou `developer_id+workspace_id`)
 - quando recebe um path do cliente que nao existe no servidor, tenta casar pelo nome do projeto ja montado em `/workspace/projects`
+- quando nao existe nenhum projeto montado, `route_project` cria um projeto logico por contexto e passa a operar em `context_only`
 - na primeira vez, seleciona por:
   - `project_root` manual (se enviado), ou
   - LLM (OpenAI/Anthropic/comando externo), ou
   - fallback heuristico local
 - nas proximas chamadas, reutiliza o projeto em cache
 - se contexto/estado sumir, o MCP recria bootstrap e reindexa RAG automaticamente
+
+Modos de execucao:
+
+- `context_only`: contexto, agentes, bootstrap, RAG e metricas funcionam; tools de codigo exigem que o repositorio seja montado/sincronizado no servidor
+- `server_execution`: o projeto esta visivel no servidor e todas as tools podem operar normalmente
 
 Variaveis de ambiente do roteador (opcionais):
 

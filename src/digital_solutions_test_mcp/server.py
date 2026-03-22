@@ -838,6 +838,107 @@ def _ensure_context_materialized(
     }
 
 
+def _binding_variables(binding: dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(binding, dict) and isinstance(binding.get("variables"), dict):
+        return dict(binding["variables"])
+    return {}
+
+
+def _is_virtual_project_root(project_root: str) -> bool:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    metadata_path = root / ".ai-test-mcp" / "project-reference.json"
+    if not metadata_path.exists() or not metadata_path.is_file():
+        return False
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(payload.get("virtual_project"))
+
+
+def _project_binding_details(identity: dict[str, str], project_root: str, requested_project_root: str | None = None) -> dict[str, Any]:
+    binding = _get_active_binding(identity)
+    variables = _binding_variables(binding)
+    server_files_available = variables.get("server_files_available")
+    if server_files_available is None:
+        server_files_available = not _is_virtual_project_root(project_root)
+    resolution = str(variables.get("resolution", "direct" if server_files_available else "virtual")).strip()
+    requested = str(variables.get("requested_project_root", "")).strip() or requested_project_root or project_root
+    return {
+        "resolution": resolution,
+        "server_files_available": bool(server_files_available),
+        "requested_project_root": _normalize_fs_path(str(requested)),
+        "execution_mode": "server_execution" if server_files_available else "context_only",
+    }
+
+
+def _project_hint_name(reference: str) -> str:
+    normalized = _normalize_fs_path(reference).rstrip("/\\")
+    if not normalized:
+        return "project"
+    name = Path(normalized).name.strip()
+    if name:
+        return name
+    fallback = re.sub(r"^[A-Za-z]:", "", normalized).strip("/\\")
+    return fallback or "project"
+
+
+def _virtual_projects_root(identity: dict[str, str]) -> Path:
+    return Path(identity["context_root"]).expanduser().resolve() / "_projects"
+
+
+def _virtual_projects_fallback_root() -> Path:
+    return Path.cwd().resolve() / ".ai-test-mcp" / "_projects"
+
+
+def _ensure_virtual_project_root(
+    project_hint: str,
+    identity: dict[str, str],
+    config_toml_path: str | None = None,
+    original_reference: str | None = None,
+) -> str:
+    project_name = _project_hint_name(project_hint)
+    root: Path | None = None
+    storage_mode = "context_root"
+    last_error: OSError | None = None
+
+    for base_root, mode in (
+        (_virtual_projects_root(identity), "context_root"),
+        (_virtual_projects_fallback_root(), "cwd_fallback"),
+    ):
+        candidate_root = base_root / _slug(project_name, fallback="project")
+        try:
+            candidate_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            last_error = exc
+            continue
+        root = candidate_root
+        storage_mode = mode
+        break
+
+    if root is None:
+        if last_error is not None:
+            raise last_error
+        raise OSError("Unable to create a virtual project root.")
+
+    metadata_path = root / ".ai-test-mcp" / "project-reference.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "project_name": project_name,
+        "project_root": str(root),
+        "virtual_project": True,
+        "storage_mode": storage_mode,
+        "original_reference": original_reference or project_hint,
+        "developer_id": identity.get("developer_id"),
+        "workspace_id": identity.get("workspace_id"),
+        "context_id": identity.get("context_id") or None,
+        "config_toml_path": config_toml_path,
+        "updated_at_utc": _utc_now_iso(),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    return str(root)
+
+
 def _resolve_project_root_from_candidates(
     requested_root: str,
     config_toml_path: str | None = None,
@@ -887,6 +988,48 @@ def _missing_project_root_message(requested_root: str, config_toml_path: str | N
     )
 
 
+def _resolve_project_reference(
+    reference: str,
+    identity: dict[str, str],
+    config_toml_path: str | None = None,
+    require_server_files: bool = False,
+) -> dict[str, Any]:
+    normalized = _normalize_fs_path(reference)
+    candidate = Path(normalized)
+    if candidate.exists():
+        return {
+            "project_root": str(candidate.resolve()),
+            "resolution": "direct",
+            "server_files_available": True,
+            "requested_project_root": normalized,
+        }
+
+    remapped = _resolve_project_root_from_candidates(normalized, config_toml_path=config_toml_path)
+    if remapped:
+        return {
+            "project_root": remapped,
+            "resolution": "remapped",
+            "server_files_available": True,
+            "requested_project_root": normalized,
+        }
+
+    if require_server_files:
+        raise FileNotFoundError(_missing_project_root_message(normalized, config_toml_path=config_toml_path))
+
+    virtual_root = _ensure_virtual_project_root(
+        project_hint=normalized,
+        identity=identity,
+        config_toml_path=config_toml_path,
+        original_reference=normalized,
+    )
+    return {
+        "project_root": virtual_root,
+        "resolution": "virtual",
+        "server_files_available": False,
+        "requested_project_root": normalized,
+    }
+
+
 def _resolve_project_root(
     project_root: str | None = None,
     context_id: str | None = None,
@@ -894,6 +1037,7 @@ def _resolve_project_root(
     workspace_id: str | None = None,
     context_root: str | None = None,
     config_toml_path: str | None = None,
+    require_server_files: bool = False,
 ) -> str:
     identity = _resolve_identity(
         context_id=context_id,
@@ -904,61 +1048,90 @@ def _resolve_project_root(
     )
 
     if project_root and project_root.strip():
-        resolved = _normalize_fs_path(project_root)
-        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
-        if remapped:
-            resolved = remapped
-        elif not Path(resolved).exists():
-            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
+        resolved_payload = _resolve_project_reference(
+            reference=project_root,
+            identity=identity,
+            config_toml_path=config_toml_path,
+            require_server_files=require_server_files,
+        )
+        resolved = str(resolved_payload["project_root"])
         _set_active_binding(
             identity=identity,
             project_root=resolved,
             selected_by="manual_argument",
             selection_reason="project_root argument provided",
-            variables={},
+            variables={
+                "resolution": resolved_payload["resolution"],
+                "server_files_available": resolved_payload["server_files_available"],
+                "requested_project_root": resolved_payload["requested_project_root"],
+            },
         )
         return resolved
 
     env_project_root = os.getenv("DIGITAL_SOLUTIONS_PROJECT_ROOT", "").strip()
     if env_project_root:
-        resolved = _normalize_fs_path(env_project_root)
-        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
-        if remapped:
-            resolved = remapped
-        elif not Path(resolved).exists():
-            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
+        resolved_payload = _resolve_project_reference(
+            reference=env_project_root,
+            identity=identity,
+            config_toml_path=config_toml_path,
+            require_server_files=require_server_files,
+        )
+        resolved = str(resolved_payload["project_root"])
         _set_active_binding(
             identity=identity,
             project_root=resolved,
             selected_by="env",
             selection_reason="DIGITAL_SOLUTIONS_PROJECT_ROOT",
-            variables={},
+            variables={
+                "resolution": resolved_payload["resolution"],
+                "server_files_available": resolved_payload["server_files_available"],
+                "requested_project_root": resolved_payload["requested_project_root"],
+            },
         )
         return resolved
 
     active_binding = _get_active_binding(identity)
     if active_binding:
         active_root = _normalize_fs_path(str(active_binding.get("project_root", "")).strip())
-        remapped = _resolve_project_root_from_candidates(active_root, config_toml_path=config_toml_path)
-        if remapped:
-            return remapped
+        variables = _binding_variables(active_binding)
+        server_files_available = variables.get("server_files_available")
+        if server_files_available is None and active_root:
+            server_files_available = not _is_virtual_project_root(active_root)
+        requested_project_root = str(variables.get("requested_project_root", "")).strip() or active_root
+
+        if require_server_files and server_files_available is False:
+            resolved_payload = _resolve_project_reference(
+                reference=requested_project_root,
+                identity=identity,
+                config_toml_path=config_toml_path,
+                require_server_files=True,
+            )
+            return str(resolved_payload["project_root"])
+
+        if active_root and Path(active_root).exists():
+            return str(Path(active_root).resolve())
 
     settings_payload = runtime_settings(project_root=None, config_toml_path=config_toml_path)
     project_settings = settings_payload.get("settings", {}).get("project", {})
     config_project_root = str(project_settings.get("project_root", "")).strip()
     if config_project_root:
-        resolved = _normalize_fs_path(config_project_root)
-        remapped = _resolve_project_root_from_candidates(resolved, config_toml_path=config_toml_path)
-        if remapped:
-            resolved = remapped
-        elif not Path(resolved).exists():
-            raise FileNotFoundError(_missing_project_root_message(resolved, config_toml_path=config_toml_path))
+        resolved_payload = _resolve_project_reference(
+            reference=config_project_root,
+            identity=identity,
+            config_toml_path=config_toml_path,
+            require_server_files=require_server_files,
+        )
+        resolved = str(resolved_payload["project_root"])
         _set_active_binding(
             identity=identity,
             project_root=resolved,
             selected_by="config_toml",
             selection_reason="[project].project_root",
-            variables={},
+            variables={
+                "resolution": resolved_payload["resolution"],
+                "server_files_available": resolved_payload["server_files_available"],
+                "requested_project_root": resolved_payload["requested_project_root"],
+            },
         )
         return resolved
 
@@ -969,16 +1142,40 @@ def _resolve_project_root(
             project_root=auto_detected,
             selected_by="auto_detect",
             selection_reason="automatic project discovery",
-            variables={},
+            variables={
+                "resolution": "auto_detect",
+                "server_files_available": True,
+                "requested_project_root": auto_detected,
+            },
         )
         return auto_detected
 
-    raise ValueError(
-        "project_root was not provided. Set project_root argument, or set "
-        "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml. "
-        "If running on server, place project(s) under /workspace/projects so auto-detection can resolve. "
-        "When multiple projects exist, call route_project once with an intent so the MCP can cache selection."
+    if require_server_files:
+        raise ValueError(
+            "project_root was not provided. Set project_root argument, or set "
+            "DIGITAL_SOLUTIONS_PROJECT_ROOT, or define [project].project_root in config.toml. "
+            "If running on server, place project(s) under /workspace/projects so auto-detection can resolve. "
+            "When multiple projects exist, call route_project once with an intent so the MCP can cache selection."
+        )
+
+    logical_root = _ensure_virtual_project_root(
+        project_hint=identity.get("context_id") or identity.get("workspace_id") or "remote-project",
+        identity=identity,
+        config_toml_path=config_toml_path,
+        original_reference=identity.get("context_id") or identity.get("workspace_id") or "remote-project",
     )
+    _set_active_binding(
+        identity=identity,
+        project_root=logical_root,
+        selected_by="virtual_default",
+        selection_reason="created logical project context because no server-side projects are visible",
+        variables={
+            "resolution": "virtual_default",
+            "server_files_available": False,
+            "requested_project_root": identity.get("context_id") or identity.get("workspace_id") or "remote-project",
+        },
+    )
+    return logical_root
 
 
 def _auto_detect_project_root(config_toml_path: str | None = None) -> str | None:
@@ -999,16 +1196,35 @@ def detect_project(
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
     """Detect .NET solution/test projects and infer required variables for test automation."""
-    return detect_project_profile(
-        _resolve_project_root(
-            project_root=project_root,
-            context_id=context_id,
-            developer_id=developer_id,
-            workspace_id=workspace_id,
-            context_root=context_root,
-            config_toml_path=config_toml_path,
-        )
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
     )
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    profile = detect_project_profile(resolved_root)
+    details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
+    return {
+        "status": "ok",
+        **profile,
+        **details,
+        "context_only_hint": (
+            "This project is currently bound as logical context only. Use bootstrap, rag_query, rag_upsert_note, "
+            "metrics_summary and resolve_context normally, but mount or sync the repository on the MCP server "
+            "before calling discover_test_targets, generate_tests, validate, coverage_gate or pipeline."
+            if not details["server_files_available"]
+            else None
+        ),
+    }
 
 
 @mcp.tool()
@@ -1055,24 +1271,51 @@ def route_project(
     selected_by = "cached"
     selection_reason = "using cached active project"
     diagnostics: dict[str, Any] = {}
+    binding_variables: dict[str, Any] = {
+        "context_id": identity["context_id"] or None,
+        "developer_id": identity["developer_id"],
+        "workspace_id": identity["workspace_id"],
+    }
 
     if project_root and project_root.strip():
-        resolved_root = _normalize_fs_path(project_root)
-        remapped = _resolve_project_root_from_candidates(resolved_root, config_toml_path=config_toml_path)
-        if remapped:
-            resolved_root = remapped
-        elif not Path(resolved_root).exists():
-            raise FileNotFoundError(_missing_project_root_message(resolved_root, config_toml_path=config_toml_path))
+        resolved_payload = _resolve_project_reference(
+            reference=project_root,
+            identity=identity,
+            config_toml_path=config_toml_path,
+            require_server_files=False,
+        )
+        resolved_root = _normalize_fs_path(str(resolved_payload["project_root"]))
         selected_by = "manual"
         selection_reason = "manual project_root provided"
+        binding_variables.update(
+            {
+                "resolution": resolved_payload["resolution"],
+                "server_files_available": resolved_payload["server_files_available"],
+                "requested_project_root": resolved_payload["requested_project_root"],
+            }
+        )
     else:
         resolved_root = ""
         if not force_reselect and cached:
             cached_root = _normalize_fs_path(str(cached.get("project_root", "")).strip())
+            cached_variables = _binding_variables(cached)
             if cached_root and Path(cached_root).exists():
                 resolved_root = cached_root
                 selection_reason = str(cached.get("selection_reason", selection_reason))
                 selected_by = "cached"
+                binding_variables.update(
+                    {
+                        "resolution": str(cached_variables.get("resolution", "cached")).strip() or "cached",
+                        "server_files_available": cached_variables.get(
+                            "server_files_available",
+                            not _is_virtual_project_root(cached_root),
+                        ),
+                        "requested_project_root": str(
+                            cached_variables.get("requested_project_root", cached_root)
+                        ).strip()
+                        or cached_root,
+                    }
+                )
             else:
                 _clear_active_binding(identity)
                 diagnostics["stale_binding_cleared"] = True
@@ -1080,23 +1323,51 @@ def route_project(
         if not resolved_root:
             candidates = _discover_project_candidates(config_toml_path=config_toml_path)
             if not candidates:
-                raise ValueError(
-                    "No .NET projects found on the MCP server. A remote MCP cannot read the developer local "
-                    "filesystem directly. Mount or sync project folders under /workspace/projects, or set "
-                    "DIGITAL_SOLUTIONS_PROJECTS_ROOT to a server-side directory that contains the APIs."
+                reference = project_root or intent.strip() or identity.get("context_id") or identity.get("workspace_id") or "remote-project"
+                resolved_payload = _resolve_project_reference(
+                    reference=reference,
+                    identity=identity,
+                    config_toml_path=config_toml_path,
+                    require_server_files=False,
                 )
-
-            selected, method, resolver_diag = _select_project_with_llm_or_heuristic(
-                intent=intent,
-                candidates=candidates,
-                config_toml_path=config_toml_path,
-            )
-            resolved_root = _normalize_fs_path(str(selected["project_root"]))
-            selected_by = method
-            selection_reason = f"selected by {method}"
-            diagnostics.update(resolver_diag)
-            diagnostics["candidate_count"] = len(candidates)
-            diagnostics["selected_project_name"] = selected["project_name"]
+                resolved_root = _normalize_fs_path(str(resolved_payload["project_root"]))
+                selected_by = "virtual"
+                selection_reason = (
+                    "created logical project context because no server-side .NET projects are visible"
+                )
+                diagnostics["candidate_count"] = 0
+                diagnostics["context_only_mode"] = True
+                diagnostics["message"] = (
+                    "Remote MCP is running in context-only mode for this project. Context, agents, metrics and RAG "
+                    "remain available, but code generation/validation tools require the repository to be mounted or "
+                    "synced on the server."
+                )
+                binding_variables.update(
+                    {
+                        "resolution": resolved_payload["resolution"],
+                        "server_files_available": resolved_payload["server_files_available"],
+                        "requested_project_root": resolved_payload["requested_project_root"],
+                    }
+                )
+            else:
+                selected, method, resolver_diag = _select_project_with_llm_or_heuristic(
+                    intent=intent,
+                    candidates=candidates,
+                    config_toml_path=config_toml_path,
+                )
+                resolved_root = _normalize_fs_path(str(selected["project_root"]))
+                selected_by = method
+                selection_reason = f"selected by {method}"
+                diagnostics.update(resolver_diag)
+                diagnostics["candidate_count"] = len(candidates)
+                diagnostics["selected_project_name"] = selected["project_name"]
+                binding_variables.update(
+                    {
+                        "resolution": "router_candidate",
+                        "server_files_available": True,
+                        "requested_project_root": resolved_root,
+                    }
+                )
 
     binding = _set_active_binding(
         identity=identity,
@@ -1104,11 +1375,7 @@ def route_project(
         selected_by=selected_by,
         selection_reason=selection_reason,
         intent=intent,
-        variables={
-            "context_id": identity["context_id"] or None,
-            "developer_id": identity["developer_id"],
-            "workspace_id": identity["workspace_id"],
-        },
+        variables=binding_variables,
     )
 
     if cached and _normalize_fs_path(str(cached.get("project_root", ""))) != resolved_root:
@@ -1133,6 +1400,8 @@ def route_project(
         "selected_by": selected_by,
         "selection_reason": selection_reason,
         "switched": switched,
+        "execution_mode": "server_execution" if binding_variables.get("server_files_available") else "context_only",
+        "server_files_available": bool(binding_variables.get("server_files_available")),
         "binding": binding,
         "ensure_context": ensure_context,
         "context_materialized": context_payload,
@@ -1168,12 +1437,14 @@ def get_active_project(
 
     root = _normalize_fs_path(str(binding.get("project_root", "")))
     exists = bool(root and Path(root).exists())
+    details = _project_binding_details(identity, root)
     return {
         "status": "ok",
         "found": True,
         "identity": identity,
         "project_root": root,
         "project_exists": exists,
+        **details,
         "binding": binding,
     }
 
@@ -1282,6 +1553,7 @@ def discover_test_targets(
         workspace_id=workspace_id,
         context_root=context_root,
         config_toml_path=config_toml_path,
+        require_server_files=True,
     )
     return discover_changes(
         project_root=resolved_root,
@@ -1309,6 +1581,7 @@ def generate_tests(
         workspace_id=workspace_id,
         context_root=context_root,
         config_toml_path=config_toml_path,
+        require_server_files=True,
     )
     return generate_tests_for_changes(
         project_root=resolved_root,
@@ -1336,6 +1609,7 @@ def validate(
         workspace_id=workspace_id,
         context_root=context_root,
         config_toml_path=config_toml_path,
+        require_server_files=True,
     )
     return run_validation(
         project_root=resolved_root,
@@ -1368,6 +1642,7 @@ def coverage_gate(
         workspace_id=workspace_id,
         context_root=context_root,
         config_toml_path=config_toml_path,
+        require_server_files=True,
     )
     return enforce_changed_coverage(
         project_root=resolved_root,
@@ -1400,6 +1675,7 @@ def pipeline(
         workspace_id=workspace_id,
         context_root=context_root,
         config_toml_path=config_toml_path,
+        require_server_files=True,
     )
     return auto_pipeline(
         project_root=resolved_root,
