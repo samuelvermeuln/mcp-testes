@@ -23,6 +23,7 @@ from .core import (
     discover_changes,
     enforce_changed_coverage,
     generate_tests_for_changes,
+    get_agents_assets_dir,
     list_context_states,
     memory_stats,
     query_memory,
@@ -2712,7 +2713,7 @@ def get_usage_guidance(
 @mcp.tool()
 def list_agent_files() -> dict[str, Any]:
     """List available agent markdown files packaged with this MCP server."""
-    agents_dir = Path(__file__).resolve().parents[2] / "assets" / "Agents.Testing"
+    agents_dir = get_agents_assets_dir()
     files = sorted([p.name for p in agents_dir.glob("*.md") if p.is_file()])
     return {
         "status": "ok",

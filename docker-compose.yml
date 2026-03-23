@@ -12,6 +12,7 @@ x-mcp-service: &mcp_service
   environment:
     DIGITAL_SOLUTIONS_MCP_CONFIG_TOML: /app/config.toml
     DIGITAL_SOLUTIONS_PROJECTS_ROOT: /workspace/projects
+    DIGITAL_SOLUTIONS_ASSETS_DIR: /app/assets/Agents.Testing
   volumes:
     - digital-solutions-mcp-data:/data
     - digital-solutions-mcp-projects:/workspace/projects

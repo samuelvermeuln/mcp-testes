@@ -3,6 +3,7 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV DIGITAL_SOLUTIONS_ASSETS_DIR=/app/assets/Agents.Testing
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates git curl \

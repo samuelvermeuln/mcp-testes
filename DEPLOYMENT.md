@@ -71,6 +71,7 @@ Sem configuracao por desenvolvedor:
 - paths Windows/Linux enviados pelo cliente podem ser remapeados para um projeto visivel no servidor pelo nome da pasta
 - se nenhum projeto estiver montado, `route_project` cria um projeto logico isolado para manter contexto e RAG; para tools de execucao, continue montando/sincronizando o repo em `/workspace/projects`
 - em ambiente local sem permissao de escrita em `/data`, o MCP usa fallback automatico para `.ai-test-mcp/_projects`
+- os assets dos agentes ficam explicitamente configurados por `DIGITAL_SOLUTIONS_ASSETS_DIR=/app/assets/Agents.Testing`
 
 Rollback por versao de imagem:
 

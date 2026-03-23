@@ -72,6 +72,7 @@ Observacoes:
 - o servidor usa volume persistente para dados e para workspace de projetos
 - `project_root` pode ser omitido: o MCP tenta detectar automaticamente em `/workspace/projects`
 - quando nenhum projeto .NET estiver visivel no servidor, `route_project` cria um projeto logico e mantem contexto, agentes, metricas e RAG sem depender do filesystem local do dev
+- os assets dos agentes sao resolvidos automaticamente e, em Docker, ficam fixados por `DIGITAL_SOLUTIONS_ASSETS_DIR=/app/assets/Agents.Testing`
 - o runtime do servidor agora le `config.toml` de verdade para escolher transporte e paths
 - o servidor publicado libera `Host`/`Origin` externos por configuracao para aceitar Claude, Codex e Copilot
 

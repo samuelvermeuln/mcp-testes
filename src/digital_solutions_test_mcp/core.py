@@ -423,9 +423,46 @@ def _mcp_state_dir(
 
 
 def _assets_agents_dir() -> Path:
-    # src/digital_solutions_test_mcp/core.py -> project_root
-    project_root = Path(__file__).resolve().parents[2]
-    return project_root / "assets" / "Agents.Testing"
+    candidates: list[Path] = []
+
+    configured_assets_dir = os.getenv("DIGITAL_SOLUTIONS_ASSETS_DIR", "").strip()
+    if configured_assets_dir:
+        candidates.append(Path(_normalize_fs_path(configured_assets_dir)).expanduser().resolve())
+
+    module_file = Path(__file__).resolve()
+    candidates.extend(
+        [
+            module_file.parent / "assets" / "Agents.Testing",
+            module_file.parents[2] / "assets" / "Agents.Testing",
+            Path.cwd().resolve() / "assets" / "Agents.Testing",
+        ]
+    )
+
+    configured_toml = os.getenv("DIGITAL_SOLUTIONS_MCP_CONFIG_TOML", "").strip()
+    if configured_toml:
+        config_path = Path(_normalize_fs_path(configured_toml)).expanduser().resolve()
+        candidates.append(config_path.parent / "assets" / "Agents.Testing")
+
+    candidates.append(Path("/app/assets/Agents.Testing"))
+
+    seen: set[Path] = set()
+    normalized_candidates: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized_candidates.append(candidate)
+
+    for candidate in normalized_candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    searched = ", ".join(str(path) for path in normalized_candidates)
+    raise FileNotFoundError(f"Agents assets not found. Searched: {searched}")
+
+
+def get_agents_assets_dir() -> Path:
+    return _assets_agents_dir()
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1014,9 +1051,6 @@ def bootstrap_project(
 
     agents_src = _assets_agents_dir()
     agents_dst = state_dir / "agents"
-    if not agents_src.exists():
-        raise FileNotFoundError(f"Agents assets not found: {agents_src}")
-
     _copy_tree(agents_src, agents_dst, overwrite=overwrite_agents)
 
     metrics_dir = state_dir / "metrics"
