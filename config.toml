@@ -48,7 +48,7 @@ default_max_chunks = 8
 default_max_chars = 7000
 
 [workspace_hooks]
-# Webhook leve para hooks locais de pre-commit e watcher opcional de mudancas.
+# Webhook leve para hooks locais de git, sync de branch e watcher opcional de mudancas.
 enabled = true
 # Recomendo configurar em producao e reaproveitar no hook-config.toml da API.
 shared_secret = ""

@@ -202,13 +202,17 @@ Memoria de backlog e revisao:
 Hooks locais e watcher opcional:
 
 - endpoint leve para hooks locais: `POST /hooks/workspace-change`
+- endpoint leve para sync de branch: `POST /hooks/workspace-branch-state`
 - instalador do hook local: `digital-solutions-test-mcp-hooks install-pre-commit`
 - watcher opcional em background: `digital-solutions-test-mcp-hooks watch-changes`
 - o hook envia snapshot compacto dos arquivos alterados e testes relacionados, nao o projeto inteiro
+- o instalador cria `.git/hooks/pre-commit`, `.git/hooks/post-checkout` e `.git/hooks/post-merge`
+- a troca de branch, HEAD e diferenca com upstream tambem entram no contexto e no RAG para nao misturar divida de teste entre branches
 - o servidor transforma isso em `pending_change_alerts` por contexto e devolve isso para a LLM em `route_project`, `detect_project`, `get_active_project`, `get_usage_guidance`, `get_pending_change_alerts` e `prepare_test_generation_context`
+- o servidor tambem devolve `branch_switch_notice`, `branch_context` e o resumo de pendencias em outras branches para a LLM priorizar somente a branch atual
 - o servidor tambem devolve `hook_installation_required` e `hook_install_command` para a LLM instalar o hook automaticamente na API local quando ainda nao estiver configurado
 
-Instalacao do pre-commit em uma API local:
+Instalacao dos hooks locais em uma API local:
 
 ```bash
 digital-solutions-test-mcp-hooks install-pre-commit \
@@ -220,6 +224,8 @@ Arquivos criados:
 
 - `.ai-test-mcp/hook-config.toml`
 - `.git/hooks/pre-commit`
+- `.git/hooks/post-checkout`
+- `.git/hooks/post-merge`
 
 Comandos uteis:
 

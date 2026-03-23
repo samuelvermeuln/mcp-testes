@@ -56,10 +56,12 @@ Sinalizacao para clientes MCP:
 Workspace hooks:
 
 - endpoint HTTP: `POST /hooks/workspace-change`
+- endpoint de sync de branch: `POST /hooks/workspace-branch-state`
 - endpoint de registro: `POST /hooks/register-workspace-hook`
 - configuracao no servidor: `[workspace_hooks]` em `config.toml`
 - para o MCP devolver `hook_install_command` pronto para a LLM, configure `[workspace_hooks].public_server_url`
 - se `shared_secret` for definido, o hook local deve enviar o mesmo valor no header `X-Digital-Solutions-Hook-Secret`
+- o instalador local cria `pre-commit`, `post-checkout` e `post-merge`, entao alteracoes e mudancas de branch entram no contexto sem depender de perguntas extras da LLM
 
 ## 3) Docker / Dockploy
 

@@ -48,8 +48,9 @@ Default behavior:
 - Prefer context_only workflow when the repository is not visible on the MCP server.
 - Do not ask the developer to mount the repository as the first response.
 - Do not ask broad open-ended questions when the next tool call is already known.
-- If hook_installation_required is true, tell the external LLM to install the git pre-commit hook in the local API repository before relying on automatic change detection.
+- If hook_installation_required is true, tell the external LLM to install the local git hooks in the API repository before relying on automatic change detection.
 - If pending_change_alerts are present, tell the external LLM that recent file changes still require test work before unrelated tasks or commits.
+- If branch_switch_notice is present, tell the external LLM that the active branch changed recently and that test debt from other branches must stay isolated unless the developer explicitly switches back.
 
 When execution_mode is context_only:
 1. Call route_project.
@@ -60,11 +61,11 @@ When execution_mode is context_only:
 6. Use prompt_package so the external LLM writes the tests locally in the developer workspace.
 7. Stop the timer after validation, then call review_test_delivery.
 
-Use scan_test_obligations to remember changed files, files without tests, and files without total test coverage in the RAG/context memory so the same gaps are not asked again. In context_only mode, use the most recent ingested snapshot instead of asking for repository mounts.
+Use scan_test_obligations to remember changed files, files without tests, files without total test coverage, and branch-specific pending work in the RAG/context memory so the same gaps are not asked again. In context_only mode, use the most recent ingested snapshot instead of asking for repository mounts.
 
 Only use discover_test_targets, generate_tests, validate, coverage_gate, or pipeline when execution_mode is server_execution or when the user explicitly wants server-side execution.
 
-If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot. Do not ask for Docker mounts unless the user wants server_execution. When a class or file is requested again, preserve previous open work items and prior review findings.
+If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot. Do not ask for Docker mounts unless the user wants server_execution. When a class or file is requested again, preserve previous open work items and prior review findings for the current branch first, while only summarizing items that still belong to other branches.
 """.strip()
 
 mcp = FastMCP(
@@ -232,6 +233,7 @@ async def root_info(_request: Request) -> JSONResponse:
                 "healthz": "/healthz",
                 "workspace_change_hook": "/hooks/workspace-change",
                 "workspace_hook_register": "/hooks/register-workspace-hook",
+                "workspace_branch_state_hook": "/hooks/workspace-branch-state",
                 "sse": server_settings["sse_path"],
                 "messages": server_settings["message_path"],
                 "streamable_http": server_settings["streamable_http_path"],
@@ -252,7 +254,7 @@ async def root_info(_request: Request) -> JSONResponse:
 
 @mcp.custom_route("/hooks/workspace-change", methods=["POST"], include_in_schema=False)
 async def workspace_change_hook(request: Request) -> JSONResponse:
-    """Receive lightweight local workspace change snapshots from pre-commit hooks or optional background watchers."""
+    """Receive lightweight local workspace change snapshots from git hooks or optional background watchers."""
     hook_settings = _workspace_hook_settings()
     if not hook_settings["enabled"]:
         return JSONResponse({"status": "disabled", "message": "workspace hooks are disabled"}, status_code=403)
@@ -280,6 +282,7 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
     notes = str(payload.get("notes", "")).strip()
     change_detected_at_utc = str(payload.get("changed_at_utc", "")).strip() or None
     file_tree = str(payload.get("file_tree", "")).strip()
+    git_context = payload.get("git_context", {})
 
     project_manifest = payload.get("project_manifest", {})
     source_snapshot = payload.get("source_snapshot", {})
@@ -301,6 +304,17 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
         context_root=context_root,
     )
     resolved_root = str(route_payload["project_root"])
+    branch_payload = _record_branch_state(
+        project_root=resolved_root,
+        git_context=git_context,
+        change_source=change_source,
+        requested_project_root=project_root,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
     ingest_payload = ingest_project_snapshot(
         project_root=resolved_root,
         project_manifest_json=json.dumps(project_manifest, ensure_ascii=True),
@@ -331,6 +345,7 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
             "context_id": context_id,
             "intent": intent,
             "source": change_source,
+            "git_context": branch_payload.get("branch_context"),
         },
     )
     scan_payload = scan_test_obligations(
@@ -345,6 +360,7 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
         changed_files=[str(item) for item in changed_files if str(item).strip()],
         scan_summary=scan_payload["summary"],
         change_source=change_source,
+        git_context=git_context,
         change_detected_at_utc=change_detected_at_utc,
         notes=notes,
         context_id=context_id,
@@ -359,6 +375,8 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
             "status": "ok",
             "project_root": resolved_root,
             "execution_mode": route_payload.get("execution_mode"),
+            "branch_context": branch_payload.get("branch_context"),
+            "branch_switch_notice": branch_payload.get("branch_switch_notice"),
             "ingest": {
                 "upserted_sources_count": ingest_payload.get("upserted_sources_count", 0),
                 "state_dir": ingest_payload.get("state_dir"),
@@ -387,7 +405,7 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/hooks/register-workspace-hook", methods=["POST"], include_in_schema=False)
 async def register_workspace_hook(request: Request) -> JSONResponse:
-    """Register that the local git pre-commit hook has been installed for a given developer/workspace/project identity."""
+    """Register that the local git hooks have been installed for a given developer/workspace/project identity."""
     hook_settings = _workspace_hook_settings()
     if not hook_settings["enabled"]:
         return JSONResponse({"status": "disabled", "message": "workspace hooks are disabled"}, status_code=403)
@@ -411,6 +429,7 @@ async def register_workspace_hook(request: Request) -> JSONResponse:
     workspace_id = str(payload.get("workspace_id", "")).strip() or None
     context_id = str(payload.get("context_id", "")).strip() or None
     context_root = str(payload.get("context_root", "")).strip() or None
+    git_context = payload.get("git_context", {})
 
     route_payload = route_project(
         intent=intent,
@@ -432,18 +451,119 @@ async def register_workspace_hook(request: Request) -> JSONResponse:
     status_payload = {
         "installed": True,
         "installed_at_utc": _utc_now_iso(),
+        "last_seen_at_utc": _utc_now_iso(),
         "project_root": resolved_root,
         "requested_project_root": project_root,
         "developer_id": developer_id,
         "workspace_id": workspace_id,
         "context_id": context_id,
         "intent": intent,
+        "git_context": _normalize_git_context(git_context) or None,
     }
+    _write_json_file(status_path, status_payload)
+    branch_payload = _record_branch_state(
+        project_root=resolved_root,
+        git_context=git_context,
+        change_source="hook-registration",
+        requested_project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "project_root": resolved_root,
+            "workspace_hook_status": status_payload,
+            "branch_context": branch_payload.get("branch_context"),
+            "branch_switch_notice": branch_payload.get("branch_switch_notice"),
+        }
+    )
+
+
+@mcp.custom_route("/hooks/workspace-branch-state", methods=["POST"], include_in_schema=False)
+async def workspace_branch_state_hook(request: Request) -> JSONResponse:
+    """Receive lightweight branch/head sync events from local git hooks or background watchers."""
+    hook_settings = _workspace_hook_settings()
+    if not hook_settings["enabled"]:
+        return JSONResponse({"status": "disabled", "message": "workspace hooks are disabled"}, status_code=403)
+
+    shared_secret = str(hook_settings.get("shared_secret", "")).strip()
+    provided_secret = request.headers.get("X-Digital-Solutions-Hook-Secret", "").strip()
+    if shared_secret and provided_secret != shared_secret:
+        return JSONResponse({"status": "error", "message": "Invalid workspace hook secret."}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON payload."}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"status": "error", "message": "Payload must be a JSON object."}, status_code=400)
+
+    project_root = str(payload.get("project_root", "")).strip() or None
+    intent = str(payload.get("intent", "")).strip()
+    developer_id = str(payload.get("developer_id", "")).strip() or None
+    workspace_id = str(payload.get("workspace_id", "")).strip() or None
+    context_id = str(payload.get("context_id", "")).strip() or None
+    context_root = str(payload.get("context_root", "")).strip() or None
+    change_source = str(payload.get("change_source", "")).strip() or "branch-sync"
+    notes = str(payload.get("notes", "")).strip()
+    git_context = payload.get("git_context", {})
+
+    route_payload = route_project(
+        intent=intent,
+        project_root=project_root,
+        ensure_context=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    resolved_root = str(route_payload["project_root"])
+    branch_payload = _record_branch_state(
+        project_root=resolved_root,
+        git_context=git_context,
+        change_source=change_source,
+        requested_project_root=project_root,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    status_path = _workspace_hook_status_path(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    status_payload = _read_json_file(status_path, default={})
+    status_payload.update(
+        {
+            "installed": bool(status_payload.get("installed", False)),
+            "last_seen_at_utc": _utc_now_iso(),
+            "project_root": resolved_root,
+            "requested_project_root": project_root,
+            "developer_id": developer_id,
+            "workspace_id": workspace_id,
+            "context_id": context_id,
+            "intent": intent,
+            "source": change_source,
+            "git_context": branch_payload.get("branch_context"),
+        }
+    )
     _write_json_file(status_path, status_payload)
     return JSONResponse(
         {
             "status": "ok",
             "project_root": resolved_root,
+            "execution_mode": route_payload.get("execution_mode"),
+            "branch_context": branch_payload.get("branch_context"),
+            "branch_switch_notice": branch_payload.get("branch_switch_notice"),
+            "last_branch_switch": branch_payload.get("last_branch_switch"),
             "workspace_hook_status": status_payload,
         }
     )
@@ -2070,6 +2190,24 @@ def _workspace_hook_status_path(
     ) / "workspace-hook-status.json"
 
 
+def _branch_state_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "workspace-branch-state.json"
+
+
 def _load_items_file(path: Path, root_key: str = "items") -> dict[str, Any]:
     payload = _read_json_file(path, default={"schema_version": 1, root_key: []})
     if not isinstance(payload.get(root_key), list):
@@ -2117,12 +2255,335 @@ def _age_description(raw: str) -> str:
     return f"{delta_seconds // 86400}d ago"
 
 
-def _pending_alert_key(project_root: str, changed_files: list[str], developer_id: str, workspace_id: str) -> str:
+def _normalize_branch_name(value: str) -> str:
+    normalized = str(value or "").strip()
+    return normalized or "HEAD"
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() == "none":
+        return None
+    return normalized
+
+
+def _normalize_git_context(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    branch_name = _normalize_branch_name(str(payload.get("branch_name", "")).strip())
+    head_sha = str(payload.get("head_sha", "")).strip()
+    upstream_branch = str(payload.get("upstream_branch", "")).strip() or None
+    upstream_sha = str(payload.get("upstream_sha", "")).strip() or None
+    observed_at_utc = str(payload.get("observed_at_utc", "")).strip() or _utc_now_iso()
+
+    try:
+        ahead_count = int(payload.get("ahead_count", 0) or 0)
+    except (TypeError, ValueError):
+        ahead_count = 0
+    try:
+        behind_count = int(payload.get("behind_count", 0) or 0)
+    except (TypeError, ValueError):
+        behind_count = 0
+
+    return {
+        "branch_name": branch_name,
+        "head_sha": head_sha or None,
+        "upstream_branch": upstream_branch,
+        "upstream_sha": upstream_sha,
+        "ahead_count": max(0, ahead_count),
+        "behind_count": max(0, behind_count),
+        "working_tree_dirty": _boolish(payload.get("working_tree_dirty"), default=False),
+        "detached_head": _boolish(payload.get("detached_head"), default=branch_name == "HEAD"),
+        "observed_at_utc": observed_at_utc,
+    }
+
+
+def _branch_matches(item_branch_name: str | None, current_branch_name: str | None) -> bool:
+    normalized_current = str(current_branch_name or "").strip()
+    if not normalized_current:
+        return True
+    normalized_item = str(item_branch_name or "").strip()
+    if not normalized_item:
+        return True
+    return _normalize_branch_name(normalized_item).lower() == _normalize_branch_name(normalized_current).lower()
+
+
+def _branch_label(branch_name: str | None) -> str:
+    normalized = str(branch_name or "").strip()
+    return normalized or "(unknown branch)"
+
+
+def _group_alerts_for_other_branches(
+    alerts: list[dict[str, Any]],
+    current_branch_name: str | None,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in alerts:
+        branch_name = str(item.get("branch_name", "")).strip()
+        if _branch_matches(branch_name, current_branch_name):
+            continue
+        key = _branch_label(branch_name)
+        summary = grouped.setdefault(
+            key,
+            {
+                "branch_name": key,
+                "alerts_count": 0,
+                "latest_seen_at_utc": "",
+                "latest_age_description": "",
+                "open_files": [],
+            },
+        )
+        summary["alerts_count"] += 1
+        candidate_seen = str(item.get("last_seen_at_utc", "") or item.get("created_at_utc", "")).strip()
+        if candidate_seen > str(summary.get("latest_seen_at_utc", "")):
+            summary["latest_seen_at_utc"] = candidate_seen
+            summary["latest_age_description"] = str(item.get("age_description", "")).strip()
+        for open_file in item.get("open_files", []) if isinstance(item.get("open_files"), list) else []:
+            source_file = str(open_file.get("source_file", "")).strip()
+            if not source_file:
+                continue
+            if any(_paths_match(str(existing.get("source_file", "")), source_file) for existing in summary["open_files"]):
+                continue
+            summary["open_files"].append(
+                {
+                    "source_file": source_file,
+                    "status": open_file.get("status"),
+                }
+            )
+            if len(summary["open_files"]) >= 5:
+                break
+    return sorted(
+        grouped.values(),
+        key=lambda item: (int(item.get("alerts_count", 0)), str(item.get("latest_seen_at_utc", ""))),
+        reverse=True,
+    )
+
+
+def _group_work_items_for_other_branches(
+    items: list[dict[str, Any]],
+    current_branch_name: str | None,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        branch_name = str(item.get("branch_name", "")).strip()
+        if _branch_matches(branch_name, current_branch_name):
+            continue
+        key = _branch_label(branch_name)
+        summary = grouped.setdefault(
+            key,
+            {
+                "branch_name": key,
+                "open_items_count": 0,
+                "latest_requested_at_utc": "",
+                "objectives": [],
+                "file_paths": [],
+            },
+        )
+        summary["open_items_count"] += 1
+        requested_at = str(item.get("last_requested_at_utc", "") or item.get("created_at_utc", "")).strip()
+        if requested_at > str(summary.get("latest_requested_at_utc", "")):
+            summary["latest_requested_at_utc"] = requested_at
+        objective = str(item.get("objective", "")).strip()
+        if objective and objective not in summary["objectives"]:
+            summary["objectives"].append(objective)
+        file_path = str(item.get("file_path", "")).strip()
+        if file_path and file_path not in summary["file_paths"]:
+            summary["file_paths"].append(file_path)
+    return sorted(
+        grouped.values(),
+        key=lambda item: (int(item.get("open_items_count", 0)), str(item.get("latest_requested_at_utc", ""))),
+        reverse=True,
+    )
+
+
+def _record_branch_state(
+    project_root: str,
+    git_context: Any,
+    change_source: str,
+    requested_project_root: str | None = None,
+    notes: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_git_context(git_context)
+    if not normalized:
+        return _branch_context_payload(
+            project_root=project_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+
+    path = _branch_state_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _read_json_file(path, default={"schema_version": 1, "current": {}, "previous": {}, "last_switch": None, "switches": []})
+    previous_current = payload.get("current", {})
+    previous_current = previous_current if isinstance(previous_current, dict) else {}
+
+    now_iso = _utc_now_iso()
+    normalized["last_seen_at_utc"] = now_iso
+    normalized["change_source"] = change_source
+    normalized["project_root"] = project_root
+    if requested_project_root:
+        normalized["requested_project_root"] = requested_project_root
+    if notes:
+        normalized["notes"] = notes
+
+    previous_branch = str(previous_current.get("branch_name", "")).strip()
+    current_branch = str(normalized.get("branch_name", "")).strip()
+    switch_event = None
+    if previous_current and previous_branch and current_branch and previous_branch.lower() != current_branch.lower():
+        switch_event = {
+            "switch_id": sha1(
+                "|".join(
+                    [
+                        _normalize_fs_path(project_root).lower(),
+                        previous_branch.lower(),
+                        current_branch.lower(),
+                        str(previous_current.get("head_sha", "")).strip(),
+                        str(normalized.get("head_sha", "")).strip(),
+                        now_iso,
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()[:16],
+            "from_branch_name": previous_branch,
+            "to_branch_name": current_branch,
+            "from_head_sha": str(previous_current.get("head_sha", "")).strip() or None,
+            "to_head_sha": str(normalized.get("head_sha", "")).strip() or None,
+            "switched_at_utc": now_iso,
+            "change_source": change_source,
+        }
+        payload["previous"] = previous_current
+        payload["last_switch"] = switch_event
+        switches = payload.get("switches", [])
+        if not isinstance(switches, list):
+            switches = []
+        switches.append(switch_event)
+        payload["switches"] = switches[-25:]
+        upsert_memory(
+            project_root=project_root,
+            source=f"branch-switch://{switch_event['switch_id']}",
+            content=json.dumps(switch_event, indent=2, ensure_ascii=True),
+            metadata={"kind": "branch_switch", "from_branch_name": previous_branch, "to_branch_name": current_branch},
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+
+    payload["schema_version"] = 1
+    payload["current"] = normalized
+    _write_json_file(path, payload)
+
+    upsert_memory(
+        project_root=project_root,
+        source="branch://current",
+        content=json.dumps(normalized, indent=2, ensure_ascii=True),
+        metadata={"kind": "branch_state", "branch_name": current_branch},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    return _branch_context_payload(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+
+def _branch_context_payload(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    path = _branch_state_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _read_json_file(path, default={"current": {}, "previous": {}, "last_switch": None})
+    current = payload.get("current", {})
+    current = current if isinstance(current, dict) else {}
+    previous = payload.get("previous", {})
+    previous = previous if isinstance(previous, dict) else {}
+    last_switch = payload.get("last_switch")
+    last_switch = last_switch if isinstance(last_switch, dict) else None
+
+    branch_name = str(current.get("branch_name", "")).strip() or None
+    notice = None
+    max_notice_seconds = min(int(_workspace_hook_settings(config_toml_path=config_toml_path)["alerts_ttl_minutes"]) * 60, 4 * 3600)
+    if last_switch and _parse_utc_timestamp(str(last_switch.get("switched_at_utc", ""))):
+        switched_at = str(last_switch.get("switched_at_utc", "")).strip()
+        switched_time = _parse_utc_timestamp(switched_at)
+        if switched_time is not None:
+            age_seconds = (datetime.now(timezone.utc) - switched_time).total_seconds()
+            if age_seconds <= max_notice_seconds:
+                notice = (
+                    f"Branch switched {_age_description(switched_at)} from "
+                    f"{last_switch.get('from_branch_name', '(unknown)')} to {last_switch.get('to_branch_name', '(unknown)')}. "
+                    "Keep current-branch test debt separate from other branches unless the developer switches back."
+                )
+
+    return {
+        "git_context_available": bool(current),
+        "branch_context": current or None,
+        "branch_name": branch_name,
+        "head_sha": _optional_text(current.get("head_sha")),
+        "upstream_branch": _optional_text(current.get("upstream_branch")),
+        "upstream_sha": _optional_text(current.get("upstream_sha")),
+        "ahead_count": int(current.get("ahead_count", 0) or 0) if current else 0,
+        "behind_count": int(current.get("behind_count", 0) or 0) if current else 0,
+        "working_tree_dirty": bool(current.get("working_tree_dirty")) if current else False,
+        "detached_head": bool(current.get("detached_head")) if current else False,
+        "observed_at_utc": _optional_text(current.get("observed_at_utc")),
+        "last_seen_at_utc": _optional_text(current.get("last_seen_at_utc")),
+        "change_source": _optional_text(current.get("change_source")),
+        "branch_switch_notice": notice,
+        "last_branch_switch": last_switch,
+        "previous_branch_context": previous or None,
+    }
+
+
+def _pending_alert_key(
+    project_root: str,
+    changed_files: list[str],
+    developer_id: str,
+    workspace_id: str,
+    branch_name: str = "",
+) -> str:
     seed = "|".join(
         [
             _normalize_fs_path(project_root).lower(),
             developer_id.strip().lower(),
             workspace_id.strip().lower(),
+            _normalize_branch_name(branch_name).lower() if branch_name.strip() else "",
             *sorted(_normalize_fs_path(path).lower() for path in changed_files if str(path).strip()),
         ]
     )
@@ -2183,16 +2644,35 @@ def _pending_change_alerts_payload(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    branch_payload = _branch_context_payload(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    current_branch_name = str(branch_payload.get("branch_name", "")).strip()
+    current_branch_alerts = [item for item in alerts if _branch_matches(str(item.get("branch_name", "")), current_branch_name)]
+    other_branch_summary = _group_alerts_for_other_branches(alerts, current_branch_name)
     attention_message = None
-    if alerts:
-        newest = alerts[0]
+    if current_branch_alerts:
+        newest = current_branch_alerts[0]
         attention_message = str(newest.get("message", "")).strip() or (
             f"Recent file changes detected {newest.get('age_description', 'recently')} and test work is still pending."
         )
+    elif other_branch_summary:
+        newest_branch = other_branch_summary[0]
+        attention_message = (
+            f"No open pending change alerts were found for the current branch, but "
+            f"{sum(int(item.get('alerts_count', 0)) for item in other_branch_summary)} pending alert(s) still exist on other branches."
+        )
     return {
-        "pending_change_alerts_count": len(alerts),
-        "pending_change_alerts": alerts[:10],
-        "attention_required": bool(alerts),
+        "pending_change_alerts_count": len(current_branch_alerts),
+        "pending_change_alerts": current_branch_alerts[:10],
+        "other_branch_pending_alerts_count": sum(int(item.get("alerts_count", 0)) for item in other_branch_summary),
+        "other_branch_pending_alerts_summary": other_branch_summary[:10],
+        "attention_required": bool(current_branch_alerts),
         "attention_message": attention_message,
     }
 
@@ -2250,7 +2730,7 @@ def _workspace_hook_guidance_payload(
     status_message = (
         None
         if installed
-        else "Workspace git hook is not registered for this context yet. Install it locally so the MCP can detect git changes automatically before commits and on future prompts."
+        else "Workspace git hooks are not registered for this context yet. Install them locally so the MCP can detect git changes automatically before commits, branch switches and future prompts."
     )
     return {
         "workspace_hook_installed": installed,
@@ -2263,7 +2743,7 @@ def _workspace_hook_guidance_payload(
                 {
                     "type": "shell",
                     "command": install_command,
-                    "why": "install the git pre-commit hook locally so file changes are detected automatically before commit and on future prompts",
+                    "why": "install the local git hooks so file changes and branch switches are detected automatically before commit and on future prompts",
                 }
             ]
             if not installed
@@ -2274,7 +2754,7 @@ def _workspace_hook_guidance_payload(
                 {
                     "type": "shell",
                     "command": install_command,
-                    "why": "install the git pre-commit hook locally so file changes are detected automatically before commit and on future prompts",
+                    "why": "install the local git hooks so file changes and branch switches are detected automatically before commit and on future prompts",
                 }
             ]
             if not installed
@@ -2288,6 +2768,7 @@ def _record_pending_change_alert(
     changed_files: list[str],
     scan_summary: dict[str, Any],
     change_source: str,
+    git_context: Any = None,
     change_detected_at_utc: str | None = None,
     notes: str = "",
     context_id: str | None = None,
@@ -2309,6 +2790,18 @@ def _record_pending_change_alert(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    branch_name = str(_normalize_git_context(git_context).get("branch_name", "")).strip()
+    if not branch_name:
+        branch_name = str(
+            _branch_context_payload(
+                project_root=project_root,
+                context_id=context_id,
+                developer_id=developer_id,
+                workspace_id=workspace_id,
+                context_root=context_root,
+                config_toml_path=config_toml_path,
+            ).get("branch_name", "")
+        ).strip()
     path = _pending_change_alerts_path(
         project_root=project_root,
         context_id=context_id,
@@ -2323,6 +2816,7 @@ def _record_pending_change_alert(
         changed_files=resolved_changed_files,
         developer_id=identity["developer_id"],
         workspace_id=identity["workspace_id"],
+        branch_name=branch_name,
     )
     existing = next((item for item in payload["alerts"] if str(item.get("alert_id")) == alert_id), None)
     now_iso = _utc_now_iso()
@@ -2360,6 +2854,8 @@ def _record_pending_change_alert(
     existing["last_seen_at_utc"] = now_iso
     existing["change_detected_at_utc"] = created_at
     existing["occurrences"] = int(existing.get("occurrences", 0)) + 1
+    existing["branch_name"] = branch_name or existing.get("branch_name")
+    existing["head_sha"] = str(_normalize_git_context(git_context).get("head_sha", "")).strip() or existing.get("head_sha")
     existing["changed_files_needing_tests"] = int(scan_summary.get("changed_files_needing_tests", 0))
     existing["files_without_total_test_coverage"] = int(scan_summary.get("files_without_total_test_coverage", 0))
     existing["files_without_any_tests"] = int(scan_summary.get("files_without_any_tests", 0))
@@ -2394,6 +2890,7 @@ def _mark_pending_alerts_status(
     project_root: str,
     file_paths: list[str],
     status: str,
+    branch_name: str = "",
     context_id: str | None = None,
     developer_id: str | None = None,
     workspace_id: str | None = None,
@@ -2414,6 +2911,8 @@ def _mark_pending_alerts_status(
     updated: list[dict[str, Any]] = []
     for item in payload["alerts"]:
         changed_files = item.get("changed_files", []) if isinstance(item.get("changed_files"), list) else []
+        if branch_name.strip() and not _branch_matches(str(item.get("branch_name", "")), branch_name):
+            continue
         if not any(_paths_match(str(candidate), file_path) for candidate in changed_files for file_path in file_paths):
             continue
         item["status"] = status
@@ -2451,13 +2950,14 @@ def _merge_snapshot_payload(existing_payload: Any, incoming_payload: Any) -> dic
     }
 
 
-def _work_item_key(file_path: str, class_name: str, method_name: str, objective: str) -> str:
+def _work_item_key(file_path: str, class_name: str, method_name: str, objective: str, branch_name: str = "") -> str:
     seed = "|".join(
         [
             _normalize_fs_path(file_path).lower(),
             class_name.strip().lower(),
             method_name.strip().lower(),
             objective.strip().lower(),
+            _normalize_branch_name(branch_name).lower() if branch_name.strip() else "",
         ]
     )
     return sha1(seed.encode("utf-8")).hexdigest()[:16]
@@ -2479,6 +2979,7 @@ def _matching_work_items(
 ) -> list[dict[str, Any]]:
     normalized_class = class_name.strip().lower()
     normalized_method = method_name.strip().lower()
+    normalized_file = _normalize_fs_path(file_path).strip()
 
     matches: list[dict[str, Any]] = []
     for item in items:
@@ -2507,6 +3008,8 @@ def _register_test_work_item(
     class_name: str = "",
     method_name: str = "",
     file_path: str = "",
+    branch_name: str = "",
+    head_sha: str = "",
     context_id: str | None = None,
     developer_id: str | None = None,
     workspace_id: str | None = None,
@@ -2523,7 +3026,13 @@ def _register_test_work_item(
     )
     payload = _load_items_file(path, root_key="items")
     items = payload["items"]
-    item_key = _work_item_key(file_path=file_path, class_name=class_name, method_name=method_name, objective=objective)
+    item_key = _work_item_key(
+        file_path=file_path,
+        class_name=class_name,
+        method_name=method_name,
+        objective=objective,
+        branch_name=branch_name,
+    )
     existing = next((item for item in items if str(item.get("work_item_id")) == item_key), None)
     suggested_test_case_id = _suggest_test_case_id(class_name=class_name, method_name=method_name, file_path=file_path or class_name)
 
@@ -2534,6 +3043,8 @@ def _register_test_work_item(
             "class_name": class_name or None,
             "method_name": method_name or None,
             "file_path": _normalize_fs_path(file_path) or None,
+            "branch_name": branch_name or None,
+            "head_sha": head_sha or None,
             "suggested_test_case_id": suggested_test_case_id,
             "status": "requested",
             "request_count": 0,
@@ -2545,6 +3056,8 @@ def _register_test_work_item(
     existing["class_name"] = class_name or existing.get("class_name")
     existing["method_name"] = method_name or existing.get("method_name")
     existing["file_path"] = _normalize_fs_path(file_path) or existing.get("file_path")
+    existing["branch_name"] = branch_name or existing.get("branch_name")
+    existing["head_sha"] = head_sha or existing.get("head_sha")
     existing["suggested_test_case_id"] = existing.get("suggested_test_case_id") or suggested_test_case_id
     existing["status"] = "requested"
     existing["request_count"] = int(existing.get("request_count", 0)) + 1
@@ -2555,7 +3068,7 @@ def _register_test_work_item(
         project_root=project_root,
         source=f"workitem://{existing['work_item_id']}",
         content=json.dumps(existing, indent=2, ensure_ascii=True),
-        metadata={"kind": "test_work_item", "status": existing["status"]},
+        metadata={"kind": "test_work_item", "status": existing["status"], "branch_name": existing.get("branch_name")},
         context_id=context_id,
         developer_id=developer_id,
         workspace_id=workspace_id,
@@ -2632,6 +3145,14 @@ def detect_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     hook_guidance = _workspace_hook_guidance_payload(
         project_root=resolved_root,
         identity=identity,
@@ -2646,6 +3167,7 @@ def detect_project(
         **profile,
         **details,
         **workflow,
+        **branch_payload,
         **alerts,
         **hook_guidance,
         "context_only_hint": (
@@ -2834,6 +3356,14 @@ def route_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     hook_guidance = _workspace_hook_guidance_payload(
         project_root=resolved_root,
         identity=identity,
@@ -2854,6 +3384,7 @@ def route_project(
         "execution_mode": "server_execution" if binding_variables.get("server_files_available") else "context_only",
         "server_files_available": bool(binding_variables.get("server_files_available")),
         **_workflow_guidance_payload(bool(binding_variables.get("server_files_available"))),
+        **branch_payload,
         **alerts,
         **hook_guidance,
         "binding": binding,
@@ -2918,6 +3449,14 @@ def get_active_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    branch_payload = _branch_context_payload(
+        project_root=root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     hook_guidance = _workspace_hook_guidance_payload(
         project_root=root,
         identity=identity,
@@ -2935,6 +3474,7 @@ def get_active_project(
         "project_exists": exists,
         **details,
         **_workflow_guidance_payload(details["server_files_available"]),
+        **branch_payload,
         **alerts,
         **hook_guidance,
         "binding": binding,
@@ -3177,12 +3717,23 @@ def prepare_test_generation_context(
     )
     profile = _read_json_file(state_files["profile_path"], default={})
     variables = _read_json_file(state_files["variables_path"], default={})
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    current_branch_name = str(branch_payload.get("branch_name", "")).strip()
     work_item = _register_test_work_item(
         project_root=resolved_root,
         objective=objective,
         class_name=class_name,
         method_name=method_name,
         file_path=file_path,
+        branch_name=current_branch_name,
+        head_sha=str(branch_payload.get("head_sha", "")).strip(),
         context_id=context_id,
         developer_id=developer_id,
         workspace_id=workspace_id,
@@ -3209,6 +3760,12 @@ def prepare_test_generation_context(
             file_path=file_path,
         )
         if str(item.get("status", "")).lower() not in {"completed", "approved"}
+    ]
+    current_branch_related_work_items = [
+        item for item in related_open_work_items if _branch_matches(str(item.get("branch_name", "")), current_branch_name)
+    ]
+    other_branch_related_work_items = [
+        item for item in related_open_work_items if not _branch_matches(str(item.get("branch_name", "")), current_branch_name)
     ]
     obligations_summary = _read_json_file(
         _test_obligations_path(
@@ -3291,6 +3848,12 @@ def prepare_test_generation_context(
         prompt_lines.append(f"Focus file: {file_path}")
     if target_test_project:
         prompt_lines.append(f"Target test project hint: {target_test_project}")
+    if current_branch_name:
+        prompt_lines.append(f"Current branch: {current_branch_name}")
+    if branch_payload.get("head_sha"):
+        prompt_lines.append(f"Current HEAD: {str(branch_payload['head_sha'])[:12]}")
+    if branch_payload.get("branch_switch_notice"):
+        prompt_lines.append(f"Recent branch notice: {branch_payload['branch_switch_notice']}")
     prompt_lines.extend(
         [
             "",
@@ -3317,12 +3880,20 @@ def prepare_test_generation_context(
                         "class_name": item.get("class_name"),
                         "method_name": item.get("method_name"),
                         "file_path": item.get("file_path"),
+                        "branch_name": item.get("branch_name"),
                         "suggested_test_case_id": item.get("suggested_test_case_id"),
                         "status": item.get("status"),
                         "last_requested_at_utc": item.get("last_requested_at_utc"),
                     }
-                    for item in related_open_work_items
+                    for item in current_branch_related_work_items
                 ],
+                indent=2,
+                ensure_ascii=True,
+            ),
+            "",
+            "Open obligations remembered on other branches (informational only, do not block current branch unless the developer switches back):",
+            json.dumps(
+                _group_work_items_for_other_branches(related_open_work_items, current_branch_name)[:5],
                 indent=2,
                 ensure_ascii=True,
             ),
@@ -3332,6 +3903,13 @@ def prepare_test_generation_context(
             "",
             "Recent pending change alerts:",
             json.dumps(pending_alerts_payload["pending_change_alerts"][:5], indent=2, ensure_ascii=True),
+            "",
+            "Pending change alerts on other branches (informational only):",
+            json.dumps(
+                pending_alerts_payload.get("other_branch_pending_alerts_summary", [])[:5],
+                indent=2,
+                ensure_ascii=True,
+            ),
             "",
             "Workspace hook guidance:",
             json.dumps(
@@ -3365,7 +3943,13 @@ def prepare_test_generation_context(
         "query_used": query_text,
         "target_test_project_hint": target_test_project or None,
         "work_item": work_item,
-        "related_open_work_items": related_open_work_items,
+        **branch_payload,
+        "related_open_work_items": current_branch_related_work_items,
+        "other_branch_related_open_work_items": other_branch_related_work_items,
+        "other_branch_related_open_work_items_summary": _group_work_items_for_other_branches(
+            related_open_work_items,
+            current_branch_name,
+        ),
         **pending_alerts_payload,
         **hook_guidance,
         "prompt_package": "\n".join(prompt_lines).strip(),
@@ -3456,6 +4040,15 @@ def scan_test_obligations(
         summary["project_root"] = resolved_root
         summary["file_tree_available"] = bool(str(snapshot_state.get("file_tree", "")).strip())
 
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
     summary_path = _test_obligations_path(
         project_root=resolved_root,
         context_id=context_id,
@@ -3471,6 +4064,7 @@ def scan_test_obligations(
         "files_without_any_tests": summary["files_without_any_tests"],
         "files_without_total_test_coverage": summary["files_without_total_test_coverage"],
         "files_with_total_test_coverage": summary["files_with_total_test_coverage"],
+        "branch_name": branch_payload.get("branch_name"),
         "top_open_files": [
             {
                 "source_file": item["source_file"],
@@ -3486,7 +4080,7 @@ def scan_test_obligations(
         project_root=resolved_root,
         source="analysis://test-obligations-summary",
         content=json.dumps(summary_compact, indent=2, ensure_ascii=True),
-        metadata={"kind": "test_obligations_summary"},
+        metadata={"kind": "test_obligations_summary", "branch_name": branch_payload.get("branch_name")},
         context_id=context_id,
         developer_id=developer_id,
         workspace_id=workspace_id,
@@ -3504,6 +4098,7 @@ def scan_test_obligations(
             project_root=resolved_root,
             file_paths=changed_source_files,
             status="addressed",
+            branch_name=str(branch_payload.get("branch_name", "")).strip(),
             context_id=context_id,
             developer_id=developer_id,
             workspace_id=workspace_id,
@@ -3515,6 +4110,7 @@ def scan_test_obligations(
         "status": "ok",
         "project_root": resolved_root,
         **details,
+        **branch_payload,
         "scan_mode": summary.get("scan_mode"),
         "summary_path": str(summary_path),
         "persisted_to_rag": True,
@@ -3569,6 +4165,15 @@ def list_open_test_work_items(
         ),
         root_key="items",
     )
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    current_branch_name = str(branch_payload.get("branch_name", "")).strip()
     items = [
         item
         for item in payload["items"]
@@ -3576,12 +4181,17 @@ def list_open_test_work_items(
     ]
     if class_name or method_name or file_path:
         items = _matching_work_items(items, class_name=class_name, method_name=method_name, file_path=file_path)
-    items.sort(key=lambda item: str(item.get("last_requested_at_utc", "")), reverse=True)
+    current_branch_items = [item for item in items if _branch_matches(str(item.get("branch_name", "")), current_branch_name)]
+    other_branch_items = [item for item in items if not _branch_matches(str(item.get("branch_name", "")), current_branch_name)]
+    current_branch_items.sort(key=lambda item: str(item.get("last_requested_at_utc", "")), reverse=True)
     return {
         "status": "ok",
         "project_root": resolved_root,
-        "open_items_count": len(items),
-        "items": items,
+        **branch_payload,
+        "open_items_count": len(current_branch_items),
+        "items": current_branch_items,
+        "other_branch_open_items_count": len(other_branch_items),
+        "other_branch_open_items_summary": _group_work_items_for_other_branches(items, current_branch_name),
         "generated_at_utc": _utc_now_iso(),
     }
 
@@ -3633,18 +4243,39 @@ def review_test_delivery(
         ),
         root_key="items",
     )
-    related_items = _matching_work_items(
+    branch_payload = _branch_context_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    current_branch_name = str(branch_payload.get("branch_name", "")).strip()
+    all_related_items = _matching_work_items(
         work_items_payload["items"],
         class_name=class_name,
         method_name=method_name,
         file_path=file_path,
     )
-    related_items = [item for item in related_items if str(item.get("status", "")).lower() != "completed"]
+    related_items = [
+        item
+        for item in all_related_items
+        if str(item.get("status", "")).lower() != "completed"
+        and _branch_matches(str(item.get("branch_name", "")), current_branch_name)
+    ]
+    other_branch_related_items = [
+        item
+        for item in all_related_items
+        if str(item.get("status", "")).lower() != "completed"
+        and not _branch_matches(str(item.get("branch_name", "")), current_branch_name)
+    ]
     current_work_item_id = _work_item_key(
         file_path=file_path,
         class_name=class_name,
         method_name=method_name,
         objective=objective,
+        branch_name=current_branch_name,
     )
     carry_over_items = [
         item
@@ -3703,6 +4334,16 @@ def review_test_delivery(
                     "objectives": pending_objectives,
                 }
             )
+
+    if other_branch_related_items:
+        findings.append(
+            {
+                "severity": "low",
+                "code": "OTHER_BRANCH_OBLIGATIONS",
+                "message": "There are remembered open testing obligations on other branches. They are informational only unless the developer switches branches.",
+                "branches": _group_work_items_for_other_branches(other_branch_related_items, current_branch_name),
+            }
+        )
 
     if not ids_to_check:
         findings.append(
@@ -3782,6 +4423,7 @@ def review_test_delivery(
             project_root=resolved_root,
             file_paths=[file_path] if file_path else [],
             status="addressed" if verdict == "APPROVED" else "open",
+            branch_name=current_branch_name,
             context_id=context_id,
             developer_id=developer_id,
             workspace_id=workspace_id,
@@ -3800,6 +4442,7 @@ def review_test_delivery(
         "class_name": class_name or None,
         "method_name": method_name or None,
         "file_path": _normalize_fs_path(file_path) or None,
+        "branch_name": current_branch_name or None,
         "delivered_test_files": delivered_test_files,
         "delivered_test_names": delivered_test_names,
         "test_case_ids": ids_to_check,
@@ -3836,7 +4479,7 @@ def review_test_delivery(
         project_root=resolved_root,
         source=f"review://{review_result['review_id']}",
         content=json.dumps(review_result, indent=2, ensure_ascii=True),
-        metadata={"kind": "delivery_review", "verdict": verdict},
+        metadata={"kind": "delivery_review", "verdict": verdict, "branch_name": current_branch_name},
         context_id=context_id,
         developer_id=developer_id,
         workspace_id=workspace_id,
@@ -3847,10 +4490,15 @@ def review_test_delivery(
     return {
         "status": "ok",
         "project_root": resolved_root,
+        **branch_payload,
         "verdict": verdict,
         "findings": findings,
         "related_open_work_items": related_items,
         "carry_over_work_items": carry_over_items,
+        "other_branch_related_open_work_items_summary": _group_work_items_for_other_branches(
+            other_branch_related_items,
+            current_branch_name,
+        ),
         "updated_work_items": updated_items,
         "updated_pending_alerts": updated_alerts,
         "missing_time_tracking": [
@@ -4339,7 +4987,7 @@ def get_pending_change_alerts(
     context_root: str | None = None,
     config_toml_path: str | None = None,
 ) -> dict[str, Any]:
-    """Return recent pending change alerts created by the local pre-commit hook or optional background watcher."""
+    """Return recent pending change alerts created by local git hooks or the optional background watcher."""
     resolved_root = _resolve_project_root(
         project_root=project_root,
         context_id=context_id,
@@ -4351,6 +4999,14 @@ def get_pending_change_alerts(
     return {
         "status": "ok",
         "project_root": resolved_root,
+        **_branch_context_payload(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
         **_pending_change_alerts_payload(
             project_root=resolved_root,
             context_id=context_id,
@@ -4440,7 +5096,38 @@ def get_usage_guidance(
         else {
             "pending_change_alerts_count": 0,
             "pending_change_alerts": [],
+            "other_branch_pending_alerts_count": 0,
+            "other_branch_pending_alerts_summary": [],
             "attention_required": False,
+        }
+    )
+    branch_payload = (
+        _branch_context_payload(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        if resolved_root
+        else {
+            "git_context_available": False,
+            "branch_context": None,
+            "branch_name": None,
+            "head_sha": None,
+            "upstream_branch": None,
+            "upstream_sha": None,
+            "ahead_count": 0,
+            "behind_count": 0,
+            "working_tree_dirty": False,
+            "detached_head": False,
+            "observed_at_utc": None,
+            "last_seen_at_utc": None,
+            "change_source": None,
+            "branch_switch_notice": None,
+            "last_branch_switch": None,
+            "previous_branch_context": None,
         }
     )
     return {
@@ -4448,6 +5135,7 @@ def get_usage_guidance(
         "project_root": resolved_root,
         **details,
         **workflow,
+        **branch_payload,
         **hook_guidance,
         **alerts,
         "server_instructions": SERVER_INSTRUCTIONS,
@@ -4483,8 +5171,9 @@ def context_only_workflow_prompt(objective: str = "") -> list[str]:
         "Use the context-only workflow for this MCP.",
         "Do not ask the developer to mount the repository as the first step.",
         "Do not ask broad open-ended questions.",
-        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change detection.",
+        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change or branch detection.",
         "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
+        "If branch_switch_notice is returned, treat the current branch as the active scope and keep other-branch obligations informational unless the developer switches back.",
         "Call these tools in order:",
         "1. route_project",
         "2. bootstrap_with_context or ingest_project_snapshot",
@@ -4510,8 +5199,9 @@ def server_execution_workflow_prompt(objective: str = "") -> list[str]:
     prompt_lines = [
         "Use the server-execution workflow for this MCP.",
         "The repository is visible to the MCP server, so direct generation and validation tools may be used.",
-        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change detection.",
+        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change or branch detection.",
         "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
+        "If branch_switch_notice is returned, keep current-branch obligations separate from other-branch obligations unless the developer switches back.",
         "Recommended sequence:",
         "1. route_project",
         "2. scan_test_obligations",

@@ -36,6 +36,11 @@ def _safe_read(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
+def _git_output(root: Path, command: list[str]) -> str:
+    result = _run(command, cwd=root)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def _git_root(project_root: str) -> Path:
     root = Path(project_root).resolve()
     result = _run(["git", "rev-parse", "--show-toplevel"], cwd=root)
@@ -108,6 +113,38 @@ def _load_hook_config(path: Path) -> dict[str, Any]:
     config = _load_toml(path)
     section = config.get("workspace_hook", {}) if isinstance(config, dict) else {}
     return section if isinstance(section, dict) else {}
+
+
+def _git_branch_context(root: Path) -> dict[str, Any]:
+    branch_name = _git_output(root, ["git", "rev-parse", "--abbrev-ref", "HEAD"]) or "HEAD"
+    head_sha = _git_output(root, ["git", "rev-parse", "HEAD"])
+    upstream_branch = _git_output(root, ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    upstream_sha = _git_output(root, ["git", "rev-parse", "@{u}"]) if upstream_branch else ""
+    ahead = 0
+    behind = 0
+    if upstream_branch:
+        counts_raw = _git_output(root, ["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream_branch}"])
+        parts = counts_raw.split()
+        if len(parts) == 2:
+            try:
+                ahead = int(parts[0])
+                behind = int(parts[1])
+            except ValueError:
+                ahead = 0
+                behind = 0
+    dirty = bool(_git_output(root, ["git", "status", "--porcelain"]))
+    detached = branch_name == "HEAD"
+    return {
+        "branch_name": branch_name,
+        "head_sha": head_sha,
+        "upstream_branch": upstream_branch or None,
+        "upstream_sha": upstream_sha or None,
+        "ahead_count": ahead,
+        "behind_count": behind,
+        "working_tree_dirty": dirty,
+        "detached_head": detached,
+        "observed_at_utc": _utc_now_iso(),
+    }
 
 
 def _git_changed_files(root: Path, staged_only: bool, include_working_tree: bool) -> list[str]:
@@ -240,6 +277,29 @@ def _build_change_payload(
         "file_tree": "\n".join(selected_files),
         "source_snapshot": {"files": snapshot_files},
         "changed_files": changed_source_files,
+        "git_context": _git_branch_context(root),
+    }
+
+
+def _build_branch_payload(
+    root: Path,
+    intent: str,
+    developer_id: str,
+    workspace_id: str,
+    context_id: str,
+    notes: str,
+    change_source: str,
+) -> dict[str, Any]:
+    return {
+        "intent": intent or root.name,
+        "project_root": str(root),
+        "developer_id": developer_id,
+        "workspace_id": workspace_id,
+        "context_id": context_id or None,
+        "notes": notes,
+        "change_source": change_source,
+        "changed_at_utc": _utc_now_iso(),
+        "git_context": _git_branch_context(root),
     }
 
 
@@ -296,6 +356,7 @@ def _register_hook_installation(
             "workspace_id": workspace_id,
             "context_id": context_id or None,
             "intent": intent,
+            "git_context": _git_branch_context(project_root),
         },
         shared_secret=shared_secret,
     )
@@ -338,7 +399,7 @@ def install_pre_commit(args: argparse.Namespace) -> int:
         "max_content_chars": int(_resolve_value(args.max_content_chars, existing.get("max_content_chars"), "DIGITAL_SOLUTIONS_HOOK_MAX_CONTENT_CHARS", DEFAULT_MAX_CONTENT_CHARS)),
     }
     if not values["server_url"]:
-        raise RuntimeError("server_url is required to install the pre-commit hook.")
+        raise RuntimeError("server_url is required to install the local git hooks.")
 
     _write_hook_config(config_path, values)
 
@@ -350,6 +411,22 @@ set -euo pipefail
     hook_path.parent.mkdir(parents=True, exist_ok=True)
     hook_path.write_text(hook_content, encoding="utf-8")
     hook_path.chmod(0o755)
+
+    post_checkout_path = root / ".git" / "hooks" / "post-checkout"
+    post_checkout_content = f"""#!/usr/bin/env bash
+set -euo pipefail
+"{sys.executable}" -m digital_solutions_test_mcp.workspace_hooks sync-branch-state --project-root "{root}" --config-path "{config_path}" --change-source "post-checkout"
+"""
+    post_checkout_path.write_text(post_checkout_content, encoding="utf-8")
+    post_checkout_path.chmod(0o755)
+
+    post_merge_path = root / ".git" / "hooks" / "post-merge"
+    post_merge_content = f"""#!/usr/bin/env bash
+set -euo pipefail
+"{sys.executable}" -m digital_solutions_test_mcp.workspace_hooks sync-branch-state --project-root "{root}" --config-path "{config_path}" --change-source "post-merge"
+"""
+    post_merge_path.write_text(post_merge_content, encoding="utf-8")
+    post_merge_path.chmod(0o755)
 
     try:
         _register_hook_installation(
@@ -366,6 +443,8 @@ set -euo pipefail
         print(f"warning: unable to register workspace hook on the MCP server: {exc}", file=sys.stderr)
 
     print(f"pre-commit hook installed at {hook_path}")
+    print(f"post-checkout hook installed at {post_checkout_path}")
+    print(f"post-merge hook installed at {post_merge_path}")
     print(f"hook config written to {config_path}")
     return 0
 
@@ -432,6 +511,49 @@ def capture_changes(args: argparse.Namespace) -> int:
     return 0
 
 
+def sync_branch_state(args: argparse.Namespace) -> int:
+    root = _git_root(args.project_root)
+    config_path = _resolve_config_path(root, args.config_path or "")
+    config = _load_hook_config(config_path)
+
+    server_url = _resolve_value(args.server_url, config.get("server_url"), "DIGITAL_SOLUTIONS_HOOK_SERVER_URL")
+    developer_id = _resolve_value(args.developer_id, config.get("developer_id"), "DIGITAL_SOLUTIONS_DEVELOPER_ID", os.getenv("USERNAME", "") or os.getenv("USER", "") or "dev")
+    workspace_id = _resolve_value(args.workspace_id, config.get("workspace_id"), "DIGITAL_SOLUTIONS_WORKSPACE_ID", root.name)
+    context_id = _resolve_value(args.context_id, config.get("context_id"), "DIGITAL_SOLUTIONS_CONTEXT_ID", "")
+    intent = _resolve_value(args.intent, config.get("intent"), "DIGITAL_SOLUTIONS_PROJECT_INTENT", root.name)
+    shared_secret = _resolve_value(args.shared_secret, config.get("shared_secret"), "DIGITAL_SOLUTIONS_WORKSPACE_HOOK_SECRET", "")
+
+    if not server_url:
+        raise RuntimeError("server_url is required. Configure it in hook-config.toml or pass --server-url.")
+
+    payload = _build_branch_payload(
+        root=root,
+        intent=intent,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_id=context_id,
+        notes=args.notes or "",
+        change_source=args.change_source,
+    )
+    if args.dry_run:
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+        return 0
+
+    response = _post_json(
+        url=server_url.rstrip("/") + "/hooks/workspace-branch-state",
+        payload=payload,
+        shared_secret=shared_secret,
+    )
+    branch_context = response.get("branch_context", {}) if isinstance(response.get("branch_context"), dict) else {}
+    print(
+        f"workspace branch sync: {branch_context.get('branch_name', 'unknown')} "
+        f"{branch_context.get('head_sha', '')[:8]}"
+    )
+    if response.get("branch_switch_notice"):
+        print(str(response["branch_switch_notice"]))
+    return 0
+
+
 def watch_changes(args: argparse.Namespace) -> int:
     root = _git_root(args.project_root)
     config_path = _resolve_config_path(root, args.config_path or "")
@@ -440,10 +562,28 @@ def watch_changes(args: argparse.Namespace) -> int:
         _resolve_value(args.poll_seconds, config.get("watch_poll_seconds"), "DIGITAL_SOLUTIONS_HOOK_WATCH_POLL_SECONDS", 20)
     )
     last_signature = ""
+    last_branch_signature = ""
 
     while True:
         changed_files = _git_changed_files(root, staged_only=False, include_working_tree=True)
         source_files = [path for path in changed_files if path.lower().endswith(".cs") and not _is_test_path(path)]
+        branch_signature = json.dumps(_git_branch_context(root), sort_keys=True, ensure_ascii=True)
+        if branch_signature != last_branch_signature:
+            sync_args = argparse.Namespace(
+                project_root=str(root),
+                config_path=str(config_path),
+                server_url=args.server_url,
+                developer_id=args.developer_id,
+                workspace_id=args.workspace_id,
+                context_id=args.context_id,
+                intent=args.intent,
+                shared_secret=args.shared_secret,
+                notes=args.notes,
+                change_source="background-branch-sync",
+                dry_run=args.dry_run,
+            )
+            sync_branch_state(sync_args)
+            last_branch_signature = branch_signature
         signature = _change_signature(root, source_files, include_working_tree=True) if source_files else ""
         if source_files and signature != last_signature:
             capture_args = argparse.Namespace(
@@ -474,10 +614,10 @@ def watch_changes(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local git hook and watcher client for Digital Solutions Test MCP.")
+    parser = argparse.ArgumentParser(description="Local git hooks and watcher client for Digital Solutions Test MCP.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    install = subparsers.add_parser("install-pre-commit", help="Install the pre-commit hook into a target API repository.")
+    install = subparsers.add_parser("install-pre-commit", help="Install the local git hooks into a target API repository.")
     install.add_argument("--project-root", default=".")
     install.add_argument("--config-path", default="")
     install.add_argument("--server-url", default="")
@@ -511,6 +651,20 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--block-on-pending", dest="block_on_pending", action="store_true")
     capture.add_argument("--no-block-on-pending", dest="block_on_pending", action="store_false")
     capture.set_defaults(func=capture_changes, block_on_pending=None)
+
+    branch = subparsers.add_parser("sync-branch-state", help="Notify the MCP that the local git branch/head changed.")
+    branch.add_argument("--project-root", default=".")
+    branch.add_argument("--config-path", default="")
+    branch.add_argument("--server-url", default="")
+    branch.add_argument("--developer-id", default="")
+    branch.add_argument("--workspace-id", default="")
+    branch.add_argument("--context-id", default="")
+    branch.add_argument("--intent", default="")
+    branch.add_argument("--shared-secret", default="")
+    branch.add_argument("--notes", default="")
+    branch.add_argument("--change-source", default="branch-sync")
+    branch.add_argument("--dry-run", action="store_true")
+    branch.set_defaults(func=sync_branch_state)
 
     watch = subparsers.add_parser("watch-changes", help="Optional background watcher that notifies the MCP when local files change.")
     watch.add_argument("--project-root", default=".")
