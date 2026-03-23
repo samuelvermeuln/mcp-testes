@@ -106,6 +106,7 @@ Campos principais:
 - `[memory].default_max_chars`
 - `[workspace_hooks].enabled`
 - `[workspace_hooks].shared_secret`
+- `[workspace_hooks].public_server_url`
 - `[workspace_hooks].alerts_ttl_minutes`
 - `[workspace_hooks].max_alerts`
 
@@ -153,15 +154,16 @@ Memoria/RAG (token optimization):
 
 1. `route_project` (passar `intent` e IDs de contexto/dev/workspace)
 2. se estiver em `context_only`, chamar `bootstrap_with_context` ou `ingest_project_snapshot` com manifesto do projeto, file tree e snapshots das classes/metodos relevantes
-3. se `pending_change_alerts` existir, priorizar esses arquivos antes de qualquer commit ou tarefa paralela
-4. chamar `scan_test_obligations` para memorizar arquivos alterados, arquivos sem testes e arquivos ainda sem cobertura total
-5. chamar `prepare_test_generation_context`
-6. chamar `start_timer` com o `TEST_CASE_ID` sugerido
-7. usar `prompt_package` retornado na LLM externa para ela escrever os testes localmente no workspace do dev
-8. apos validar, chamar `stop_timer`
-9. chamar `review_test_delivery` para confirmar aderencia ao pedido, backlog aberto e padroes
-10. apos mudancas importantes, chamar `ingest_project_snapshot` ou `rag_index_context` novamente
-11. ao trocar de API, chamar `route_project` novamente com novo `intent`
+3. se `hook_installation_required` for `true`, a LLM deve executar `hook_install_command` na API local sem perguntar
+4. se `pending_change_alerts` existir, priorizar esses arquivos antes de qualquer commit ou tarefa paralela
+5. chamar `scan_test_obligations` para memorizar arquivos alterados, arquivos sem testes e arquivos ainda sem cobertura total
+6. chamar `prepare_test_generation_context`
+7. chamar `start_timer` com o `TEST_CASE_ID` sugerido
+8. usar `prompt_package` retornado na LLM externa para ela escrever os testes localmente no workspace do dev
+9. apos validar, chamar `stop_timer`
+10. chamar `review_test_delivery` para confirmar aderencia ao pedido, backlog aberto e padroes
+11. apos mudancas importantes, chamar `ingest_project_snapshot` ou `rag_index_context` novamente
+12. ao trocar de API, chamar `route_project` novamente com novo `intent`
 
 ## Selecao inteligente de projeto
 
@@ -204,6 +206,7 @@ Hooks locais e watcher opcional:
 - watcher opcional em background: `digital-solutions-test-mcp-hooks watch-changes`
 - o hook envia snapshot compacto dos arquivos alterados e testes relacionados, nao o projeto inteiro
 - o servidor transforma isso em `pending_change_alerts` por contexto e devolve isso para a LLM em `route_project`, `detect_project`, `get_active_project`, `get_usage_guidance`, `get_pending_change_alerts` e `prepare_test_generation_context`
+- o servidor tambem devolve `hook_installation_required` e `hook_install_command` para a LLM instalar o hook automaticamente na API local quando ainda nao estiver configurado
 
 Instalacao do pre-commit em uma API local:
 

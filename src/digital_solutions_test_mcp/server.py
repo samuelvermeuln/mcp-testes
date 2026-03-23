@@ -48,6 +48,7 @@ Default behavior:
 - Prefer context_only workflow when the repository is not visible on the MCP server.
 - Do not ask the developer to mount the repository as the first response.
 - Do not ask broad open-ended questions when the next tool call is already known.
+- If hook_installation_required is true, tell the external LLM to install the git pre-commit hook in the local API repository before relying on automatic change detection.
 - If pending_change_alerts are present, tell the external LLM that recent file changes still require test work before unrelated tasks or commits.
 
 When execution_mode is context_only:
@@ -230,6 +231,7 @@ async def root_info(_request: Request) -> JSONResponse:
                 "health": "/health",
                 "healthz": "/healthz",
                 "workspace_change_hook": "/hooks/workspace-change",
+                "workspace_hook_register": "/hooks/register-workspace-hook",
                 "sse": server_settings["sse_path"],
                 "messages": server_settings["message_path"],
                 "streamable_http": server_settings["streamable_http_path"],
@@ -310,6 +312,27 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
         workspace_id=workspace_id,
         context_root=context_root,
     )
+    _write_json_file(
+        _workspace_hook_status_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+        ),
+        {
+            "installed": True,
+            "installed_at_utc": _utc_now_iso(),
+            "last_seen_at_utc": _utc_now_iso(),
+            "project_root": resolved_root,
+            "requested_project_root": project_root,
+            "developer_id": developer_id,
+            "workspace_id": workspace_id,
+            "context_id": context_id,
+            "intent": intent,
+            "source": change_source,
+        },
+    )
     scan_payload = scan_test_obligations(
         project_root=resolved_root,
         context_id=context_id,
@@ -358,6 +381,70 @@ async def workspace_change_hook(request: Request) -> JSONResponse:
                     "why": "confirm the change was covered and the time record was closed",
                 },
             ],
+        }
+    )
+
+
+@mcp.custom_route("/hooks/register-workspace-hook", methods=["POST"], include_in_schema=False)
+async def register_workspace_hook(request: Request) -> JSONResponse:
+    """Register that the local git pre-commit hook has been installed for a given developer/workspace/project identity."""
+    hook_settings = _workspace_hook_settings()
+    if not hook_settings["enabled"]:
+        return JSONResponse({"status": "disabled", "message": "workspace hooks are disabled"}, status_code=403)
+
+    shared_secret = str(hook_settings.get("shared_secret", "")).strip()
+    provided_secret = request.headers.get("X-Digital-Solutions-Hook-Secret", "").strip()
+    if shared_secret and provided_secret != shared_secret:
+        return JSONResponse({"status": "error", "message": "Invalid workspace hook secret."}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON payload."}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"status": "error", "message": "Payload must be a JSON object."}, status_code=400)
+
+    project_root = str(payload.get("project_root", "")).strip() or None
+    intent = str(payload.get("intent", "")).strip()
+    developer_id = str(payload.get("developer_id", "")).strip() or None
+    workspace_id = str(payload.get("workspace_id", "")).strip() or None
+    context_id = str(payload.get("context_id", "")).strip() or None
+    context_root = str(payload.get("context_root", "")).strip() or None
+
+    route_payload = route_project(
+        intent=intent,
+        project_root=project_root,
+        ensure_context=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    resolved_root = str(route_payload["project_root"])
+    status_path = _workspace_hook_status_path(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    status_payload = {
+        "installed": True,
+        "installed_at_utc": _utc_now_iso(),
+        "project_root": resolved_root,
+        "requested_project_root": project_root,
+        "developer_id": developer_id,
+        "workspace_id": workspace_id,
+        "context_id": context_id,
+        "intent": intent,
+    }
+    _write_json_file(status_path, status_payload)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "project_root": resolved_root,
+            "workspace_hook_status": status_payload,
         }
     )
 
@@ -470,6 +557,10 @@ def _workspace_hook_settings(config_toml_path: str | None = None) -> dict[str, A
         os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_HOOK_SECRET", "").strip()
         or str(hook_settings.get("shared_secret", "")).strip()
     )
+    public_server_url = (
+        os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_HOOK_PUBLIC_SERVER_URL", "").strip()
+        or str(hook_settings.get("public_server_url", "")).strip()
+    )
     try:
         alerts_ttl_minutes = int(
             os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_ALERTS_TTL_MINUTES", "").strip()
@@ -490,6 +581,7 @@ def _workspace_hook_settings(config_toml_path: str | None = None) -> dict[str, A
     return {
         "enabled": enabled,
         "shared_secret": shared_secret,
+        "public_server_url": public_server_url,
         "alerts_ttl_minutes": max(5, alerts_ttl_minutes),
         "max_alerts": max(10, max_alerts),
     }
@@ -1960,6 +2052,24 @@ def _pending_change_alerts_path(
     ) / "pending-change-alerts.json"
 
 
+def _workspace_hook_status_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "workspace-hook-status.json"
+
+
 def _load_items_file(path: Path, root_key: str = "items") -> dict[str, Any]:
     payload = _read_json_file(path, default={"schema_version": 1, root_key: []})
     if not isinstance(payload.get(root_key), list):
@@ -2084,6 +2194,92 @@ def _pending_change_alerts_payload(
         "pending_change_alerts": alerts[:10],
         "attention_required": bool(alerts),
         "attention_message": attention_message,
+    }
+
+
+def _workspace_hook_install_command(
+    developer_id: str,
+    workspace_id: str,
+    context_id: str,
+    intent: str,
+    config_toml_path: str | None = None,
+) -> str:
+    hook_settings = _workspace_hook_settings(config_toml_path=config_toml_path)
+    server_url = str(hook_settings.get("public_server_url", "")).strip() or "<mcp-server-url>"
+    parts = [
+        "digital-solutions-test-mcp-hooks install-pre-commit",
+        "--project-root .",
+        f"--server-url {shlex.quote(server_url)}",
+        f"--developer-id {shlex.quote(developer_id)}",
+        f"--workspace-id {shlex.quote(workspace_id)}",
+    ]
+    if context_id:
+        parts.append(f"--context-id {shlex.quote(context_id)}")
+    if intent:
+        parts.append(f"--intent {shlex.quote(intent)}")
+    return " ".join(parts)
+
+
+def _workspace_hook_guidance_payload(
+    project_root: str,
+    identity: dict[str, str],
+    intent: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    path = _workspace_hook_status_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    status_payload = _read_json_file(path, default={})
+    installed = bool(status_payload.get("installed"))
+    install_command = _workspace_hook_install_command(
+        developer_id=identity["developer_id"],
+        workspace_id=identity["workspace_id"],
+        context_id=identity["context_id"],
+        intent=intent,
+        config_toml_path=config_toml_path,
+    )
+    status_message = (
+        None
+        if installed
+        else "Workspace git hook is not registered for this context yet. Install it locally so the MCP can detect git changes automatically before commits and on future prompts."
+    )
+    return {
+        "workspace_hook_installed": installed,
+        "hook_installation_required": not installed,
+        "hook_install_command": None if installed else install_command,
+        "workspace_hook_status": status_payload or None,
+        "workspace_hook_status_message": status_message,
+        "hook_next_actions": (
+            [
+                {
+                    "type": "shell",
+                    "command": install_command,
+                    "why": "install the git pre-commit hook locally so file changes are detected automatically before commit and on future prompts",
+                }
+            ]
+            if not installed
+            else []
+        ),
+        "preflight_actions": (
+            [
+                {
+                    "type": "shell",
+                    "command": install_command,
+                    "why": "install the git pre-commit hook locally so file changes are detected automatically before commit and on future prompts",
+                }
+            ]
+            if not installed
+            else []
+        ),
     }
 
 
@@ -2436,12 +2632,22 @@ def detect_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    hook_guidance = _workspace_hook_guidance_payload(
+        project_root=resolved_root,
+        identity=identity,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     return {
         "status": "ok",
         **profile,
         **details,
         **workflow,
         **alerts,
+        **hook_guidance,
         "context_only_hint": (
             "This project is currently bound as logical context only. Preferred remote flow: bootstrap_with_context "
             "or ingest_project_snapshot, then prepare_test_generation_context so the external LLM can write tests "
@@ -2628,6 +2834,16 @@ def route_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    hook_guidance = _workspace_hook_guidance_payload(
+        project_root=resolved_root,
+        identity=identity,
+        intent=intent,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
 
     return {
         "status": "ok",
@@ -2639,6 +2855,7 @@ def route_project(
         "server_files_available": bool(binding_variables.get("server_files_available")),
         **_workflow_guidance_payload(bool(binding_variables.get("server_files_available"))),
         **alerts,
+        **hook_guidance,
         "binding": binding,
         "ensure_context": ensure_context,
         "context_materialized": context_payload,
@@ -2671,6 +2888,15 @@ def get_active_project(
             "identity": identity,
             "message": "No active project binding found for this identity.",
             "preferred_workflow": "context_only",
+            "workspace_hook_installed": False,
+            "hook_installation_required": True,
+            "hook_install_command": _workspace_hook_install_command(
+                developer_id=identity["developer_id"],
+                workspace_id=identity["workspace_id"],
+                context_id=identity["context_id"],
+                intent="",
+                config_toml_path=config_toml_path,
+            ),
             "next_actions": [
                 {
                     "tool": "route_project",
@@ -2692,6 +2918,15 @@ def get_active_project(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    hook_guidance = _workspace_hook_guidance_payload(
+        project_root=root,
+        identity=identity,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     return {
         "status": "ok",
         "found": True,
@@ -2701,6 +2936,7 @@ def get_active_project(
         **details,
         **_workflow_guidance_payload(details["server_files_available"]),
         **alerts,
+        **hook_guidance,
         "binding": binding,
     }
 
@@ -3002,6 +3238,16 @@ def prepare_test_generation_context(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    hook_guidance = _workspace_hook_guidance_payload(
+        project_root=resolved_root,
+        identity=identity,
+        intent=objective,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
 
     query_parts = [
         objective,
@@ -3087,6 +3333,18 @@ def prepare_test_generation_context(
             "Recent pending change alerts:",
             json.dumps(pending_alerts_payload["pending_change_alerts"][:5], indent=2, ensure_ascii=True),
             "",
+            "Workspace hook guidance:",
+            json.dumps(
+                {
+                    "workspace_hook_installed": hook_guidance["workspace_hook_installed"],
+                    "hook_installation_required": hook_guidance["hook_installation_required"],
+                    "hook_install_command": hook_guidance["hook_install_command"],
+                    "workspace_hook_status_message": hook_guidance["workspace_hook_status_message"],
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            "",
             "Retrieved context:",
             rag_payload.get("context_compact", ""),
             "",
@@ -3109,6 +3367,7 @@ def prepare_test_generation_context(
         "work_item": work_item,
         "related_open_work_items": related_open_work_items,
         **pending_alerts_payload,
+        **hook_guidance,
         "prompt_package": "\n".join(prompt_lines).strip(),
         "rag": rag_payload,
         "next_actions": [
@@ -4143,6 +4402,31 @@ def get_usage_guidance(
         }
 
     workflow = _workflow_guidance_payload(server_files_available)
+    hook_guidance = (
+        _workspace_hook_guidance_payload(
+            project_root=resolved_root,
+            identity=identity,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        if resolved_root
+        else {
+            "workspace_hook_installed": False,
+            "hook_installation_required": True,
+            "hook_install_command": _workspace_hook_install_command(
+                developer_id=identity["developer_id"],
+                workspace_id=identity["workspace_id"],
+                context_id=identity["context_id"],
+                intent="",
+                config_toml_path=config_toml_path,
+            ),
+            "workspace_hook_status": None,
+            "workspace_hook_status_message": "Workspace git hook is not registered for this context yet.",
+        }
+    )
     alerts = (
         _pending_change_alerts_payload(
             project_root=resolved_root,
@@ -4164,6 +4448,7 @@ def get_usage_guidance(
         "project_root": resolved_root,
         **details,
         **workflow,
+        **hook_guidance,
         **alerts,
         "server_instructions": SERVER_INSTRUCTIONS,
         "do_not_ask_for_mount_first": True,
@@ -4198,6 +4483,7 @@ def context_only_workflow_prompt(objective: str = "") -> list[str]:
         "Use the context-only workflow for this MCP.",
         "Do not ask the developer to mount the repository as the first step.",
         "Do not ask broad open-ended questions.",
+        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change detection.",
         "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
         "Call these tools in order:",
         "1. route_project",
@@ -4224,6 +4510,7 @@ def server_execution_workflow_prompt(objective: str = "") -> list[str]:
     prompt_lines = [
         "Use the server-execution workflow for this MCP.",
         "The repository is visible to the MCP server, so direct generation and validation tools may be used.",
+        "If hook_installation_required is true, run hook_install_command locally in the git repository before relying on automatic change detection.",
         "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
         "Recommended sequence:",
         "1. route_project",

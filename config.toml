@@ -52,6 +52,8 @@ default_max_chars = 7000
 enabled = true
 # Recomendo configurar em producao e reaproveitar no hook-config.toml da API.
 shared_secret = ""
+# URL publica usada pelo MCP para montar o comando pronto de instalacao do hook para a LLM.
+public_server_url = ""
 # Tempo maximo para considerar alertas de mudanca ainda "recentes".
 alerts_ttl_minutes = 1440
 # Quantidade maxima de alertas recentes retidos por contexto.

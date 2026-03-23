@@ -279,6 +279,28 @@ def _post_json(url: str, payload: dict[str, Any], shared_secret: str, timeout_se
     return parsed
 
 
+def _register_hook_installation(
+    server_url: str,
+    shared_secret: str,
+    project_root: Path,
+    developer_id: str,
+    workspace_id: str,
+    context_id: str,
+    intent: str,
+) -> None:
+    _post_json(
+        url=server_url.rstrip("/") + "/hooks/register-workspace-hook",
+        payload={
+            "project_root": str(project_root),
+            "developer_id": developer_id,
+            "workspace_id": workspace_id,
+            "context_id": context_id or None,
+            "intent": intent,
+        },
+        shared_secret=shared_secret,
+    )
+
+
 def _write_hook_config(path: Path, values: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -328,6 +350,20 @@ set -euo pipefail
     hook_path.parent.mkdir(parents=True, exist_ok=True)
     hook_path.write_text(hook_content, encoding="utf-8")
     hook_path.chmod(0o755)
+
+    try:
+        _register_hook_installation(
+            server_url=values["server_url"],
+            shared_secret=values["shared_secret"],
+            project_root=root,
+            developer_id=values["developer_id"],
+            workspace_id=values["workspace_id"],
+            context_id=values["context_id"],
+            intent=values["intent"],
+        )
+        print("workspace hook registration sent to MCP server")
+    except Exception as exc:
+        print(f"warning: unable to register workspace hook on the MCP server: {exc}", file=sys.stderr)
 
     print(f"pre-commit hook installed at {hook_path}")
     print(f"hook config written to {config_path}")
