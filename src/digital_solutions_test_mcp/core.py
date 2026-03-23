@@ -1269,6 +1269,356 @@ def _select_test_project_for_source(
     return sorted(test_projects, key=score, reverse=True)[0]
 
 
+def _iter_source_files(root: Path, csproj_files: list[Path], test_projects: list[Path]) -> list[Path]:
+    source_files: list[Path] = []
+    test_roots = [project.parent.resolve() for project in test_projects]
+
+    for file_path in _iter_files(root, ".cs"):
+        if _looks_like_test_path(file_path):
+            continue
+        if any(file_path.is_relative_to(test_root) for test_root in test_roots):
+            continue
+        source_files.append(file_path)
+
+    return sorted(source_files)
+
+
+def _iter_test_code_files(root: Path, test_projects: list[Path]) -> list[Path]:
+    candidates: set[Path] = set()
+    if test_projects:
+        search_roots = sorted({project.parent.resolve() for project in test_projects})
+        for search_root in search_roots:
+            for file_path in _iter_files(search_root, ".cs"):
+                if _looks_like_test_path(file_path):
+                    candidates.add(file_path)
+    else:
+        for file_path in _iter_files(root, ".cs"):
+            if _looks_like_test_path(file_path):
+                candidates.add(file_path)
+    return sorted(candidates)
+
+
+def _build_test_file_inventory(root: Path, test_projects: list[Path]) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for test_file in _iter_test_code_files(root, test_projects):
+        content = _safe_read(test_file)
+        inventory.append(
+            {
+                "path": test_file,
+                "relative_path": _short(test_file, root),
+                "name_lower": test_file.name.lower(),
+                "content_lower": content.lower(),
+            }
+        )
+    return inventory
+
+
+def _candidate_test_matches(
+    source_file: str,
+    class_names: list[str],
+    inventory: list[dict[str, Any]],
+    target_test_project: str | None = None,
+) -> list[dict[str, Any]]:
+    source_stem = Path(source_file).stem.lower()
+    class_tokens = [name.lower() for name in class_names if name]
+    target_root = Path(target_test_project).parent.as_posix().lower() if target_test_project else ""
+
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for entry in inventory:
+        score = 0
+        relative_path = str(entry["relative_path"]).lower()
+        name_lower = str(entry["name_lower"])
+        content_lower = str(entry["content_lower"])
+
+        if target_root and relative_path.startswith(target_root):
+            score += 3
+        if source_stem and source_stem in name_lower:
+            score += 4
+        for token in class_tokens:
+            if token in name_lower:
+                score += 6
+            if token in content_lower:
+                score += 2
+        if score > 0:
+            matches.append((score, entry))
+
+    matches.sort(key=lambda item: (item[0], len(str(item[1]["relative_path"]))), reverse=True)
+    seen_paths: set[str] = set()
+    unique_matches: list[dict[str, Any]] = []
+    for _, entry in matches:
+        rel = str(entry["relative_path"])
+        if rel in seen_paths:
+            continue
+        seen_paths.add(rel)
+        unique_matches.append(entry)
+    return unique_matches
+
+
+def _covered_method_names(method_names: list[str], matches: list[dict[str, Any]]) -> list[str]:
+    covered: list[str] = []
+    for method_name in method_names:
+        token = method_name.lower()
+        if any(re.search(rf"\b{re.escape(token)}\b", str(entry["content_lower"])) for entry in matches):
+            covered.append(method_name)
+    return covered
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    lowered = str(value).strip().lower()
+    return lowered in {"1", "true", "yes", "y", "changed"}
+
+
+def _snapshot_files(snapshot_payload: Any) -> list[dict[str, Any]]:
+    if isinstance(snapshot_payload, dict):
+        files = snapshot_payload.get("files", [])
+    elif isinstance(snapshot_payload, list):
+        files = snapshot_payload
+    else:
+        files = []
+
+    entries: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(files):
+        if not isinstance(raw_entry, dict):
+            continue
+        path = str(raw_entry.get("path", "") or raw_entry.get("name", "") or f"item-{index}").strip()
+        normalized_path = path.replace("\\", "/")
+        entries.append(
+            {
+                "path": normalized_path,
+                "content": str(raw_entry.get("content", "")),
+                "summary": str(raw_entry.get("summary", "")).strip(),
+                "kind": str(raw_entry.get("kind", "")).strip().lower(),
+                "changed": _as_bool(raw_entry.get("changed")),
+                "raw": raw_entry,
+            }
+        )
+    return entries
+
+
+def scan_snapshot_test_debt_lightweight(snapshot_payload: Any) -> dict[str, Any]:
+    files = _snapshot_files(snapshot_payload)
+    source_entries = [
+        entry
+        for entry in files
+        if entry["path"].lower().endswith(".cs") and not _looks_like_test_path(Path(entry["path"]))
+    ]
+    test_inventory = [
+        {
+            "relative_path": entry["path"],
+            "name_lower": Path(entry["path"]).name.lower(),
+            "content_lower": entry["content"].lower(),
+        }
+        for entry in files
+        if entry["path"].lower().endswith(".cs") and _looks_like_test_path(Path(entry["path"]))
+    ]
+    changed_files = {
+        entry["path"]
+        for entry in source_entries
+        if entry["changed"]
+    }
+
+    files_summary: list[dict[str, Any]] = []
+    without_any_tests = 0
+    without_total_coverage = 0
+    changed_needing_tests = 0
+
+    for entry in sorted(source_entries, key=lambda item: item["path"]):
+        content = entry["content"]
+        classes, namespace = _parse_class_and_methods(content)
+        public_classes = [item for item in classes if item["access"] == "public" and item["methods"]]
+        if not public_classes:
+            continue
+
+        source_relative = entry["path"]
+        class_names = [item["name"] for item in public_classes]
+        public_methods = sorted(
+            {
+                str(method["name"])
+                for class_entry in public_classes
+                for method in class_entry["methods"]
+                if str(method.get("name", "")).strip()
+            }
+        )
+        matches = _candidate_test_matches(
+            source_file=source_relative,
+            class_names=class_names,
+            inventory=test_inventory,
+            target_test_project=None,
+        )
+        covered_methods = _covered_method_names(public_methods, matches)
+
+        if not matches:
+            status = "no_tests"
+        elif len(covered_methods) < len(public_methods):
+            status = "partial_tests"
+        else:
+            status = "covered"
+
+        if status == "no_tests":
+            without_any_tests += 1
+        if status != "covered":
+            without_total_coverage += 1
+        if source_relative in changed_files and status != "covered":
+            changed_needing_tests += 1
+
+        files_summary.append(
+            {
+                "source_file": source_relative,
+                "namespace": namespace,
+                "source_project": None,
+                "target_test_project": None,
+                "changed": source_relative in changed_files,
+                "status": status,
+                "public_classes": class_names,
+                "public_method_count": len(public_methods),
+                "covered_method_count": len(covered_methods),
+                "covered_methods": covered_methods,
+                "missing_methods": [name for name in public_methods if name not in covered_methods],
+                "matching_test_files": [str(match["relative_path"]) for match in matches[:8]],
+                "matching_test_files_count": len(matches),
+                "latest_known_line_rate": None,
+                "matched_coverage_file": None,
+            }
+        )
+
+    files_summary.sort(key=lambda item: (item["status"], item["source_file"]))
+
+    return {
+        "project_root": None,
+        "base_ref": "snapshot",
+        "include_untracked": True,
+        "scan_mode": "snapshot",
+        "snapshot_files_indexed": len(files),
+        "total_testable_files": len(files_summary),
+        "changed_files_considered": len(changed_files),
+        "changed_files_needing_tests": changed_needing_tests,
+        "files_without_any_tests": without_any_tests,
+        "files_without_total_test_coverage": without_total_coverage,
+        "files_with_total_test_coverage": len(files_summary) - without_total_coverage,
+        "test_projects_found": 0,
+        "test_files_indexed": len(test_inventory),
+        "files": files_summary,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
+def scan_test_debt_lightweight(
+    project_root: str,
+    base_ref: str = "HEAD~1",
+    include_untracked: bool = True,
+) -> dict[str, Any]:
+    root = Path(_normalize_fs_path(project_root)).resolve()
+    csproj_files = _iter_files(root, ".csproj")
+    test_projects = [path for path in csproj_files if _is_test_project(path)]
+    changed_files = {
+        _short(path, root)
+        for path in _git_changed_files(root, base_ref=base_ref, include_untracked=include_untracked)
+        if path.exists() and path.suffix.lower() == ".cs" and not _looks_like_test_path(path)
+    }
+    latest_coverage = _latest_coverage_file(root)
+    coverage_rates = _parse_cobertura_line_rates(latest_coverage) if latest_coverage else {}
+    inventory = _build_test_file_inventory(root, test_projects)
+
+    files_summary: list[dict[str, Any]] = []
+    without_any_tests = 0
+    without_total_coverage = 0
+    changed_needing_tests = 0
+
+    for file_path in _iter_source_files(root, csproj_files, test_projects):
+        content = _safe_read(file_path)
+        classes, namespace = _parse_class_and_methods(content)
+        public_classes = [item for item in classes if item["access"] == "public" and item["methods"]]
+        if not public_classes:
+            continue
+
+        source_relative = _short(file_path, root)
+        source_project = _find_owning_project(file_path, csproj_files)
+        target_test_project = _select_test_project_for_source(
+            file_path.relative_to(root),
+            source_project,
+            test_projects,
+        )
+        class_names = [item["name"] for item in public_classes]
+        public_methods = sorted(
+            {
+                str(method["name"])
+                for class_entry in public_classes
+                for method in class_entry["methods"]
+                if str(method.get("name", "")).strip()
+            }
+        )
+        matches = _candidate_test_matches(
+            source_file=source_relative,
+            class_names=class_names,
+            inventory=inventory,
+            target_test_project=_short(target_test_project, root) if target_test_project else None,
+        )
+        covered_methods = _covered_method_names(public_methods, matches)
+        coverage_match, line_rate = _match_coverage_file(source_relative, coverage_rates) if coverage_rates else (None, None)
+
+        if not matches:
+            status = "no_tests"
+        elif len(covered_methods) < len(public_methods):
+            status = "partial_tests"
+        else:
+            status = "covered"
+
+        if line_rate is not None and line_rate < 1.0 and status == "covered":
+            status = "coverage_below_total"
+
+        if status == "no_tests":
+            without_any_tests += 1
+        if status != "covered":
+            without_total_coverage += 1
+        if source_relative in changed_files and status != "covered":
+            changed_needing_tests += 1
+
+        files_summary.append(
+            {
+                "source_file": source_relative,
+                "namespace": namespace,
+                "source_project": _short(source_project, root) if source_project else None,
+                "target_test_project": _short(target_test_project, root) if target_test_project else None,
+                "changed": source_relative in changed_files,
+                "status": status,
+                "public_classes": class_names,
+                "public_method_count": len(public_methods),
+                "covered_method_count": len(covered_methods),
+                "covered_methods": covered_methods,
+                "missing_methods": [name for name in public_methods if name not in covered_methods],
+                "matching_test_files": [str(entry["relative_path"]) for entry in matches[:8]],
+                "matching_test_files_count": len(matches),
+                "latest_known_line_rate": round(line_rate, 4) if line_rate is not None else None,
+                "matched_coverage_file": coverage_match,
+            }
+        )
+
+    files_summary.sort(key=lambda item: (item["status"], item["source_file"]))
+
+    return {
+        "project_root": str(root),
+        "base_ref": base_ref,
+        "include_untracked": include_untracked,
+        "scan_mode": "server_files",
+        "total_testable_files": len(files_summary),
+        "changed_files_considered": len(changed_files),
+        "changed_files_needing_tests": changed_needing_tests,
+        "files_without_any_tests": without_any_tests,
+        "files_without_total_test_coverage": without_total_coverage,
+        "files_with_total_test_coverage": len(files_summary) - without_total_coverage,
+        "test_projects_found": len(test_projects),
+        "test_files_indexed": len(inventory),
+        "files": files_summary,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+
 def discover_changes(
     project_root: str,
     base_ref: str = "HEAD~1",

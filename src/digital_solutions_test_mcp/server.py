@@ -8,6 +8,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,8 @@ from .core import (
     read_agent_file,
     resolve_context_state,
     run_validation,
+    scan_snapshot_test_debt_lightweight,
+    scan_test_debt_lightweight,
     start_test_timer,
     stop_test_timer,
     summarize_metrics,
@@ -49,12 +52,17 @@ Default behavior:
 When execution_mode is context_only:
 1. Call route_project.
 2. Call bootstrap_with_context or ingest_project_snapshot with project_manifest_json, source_snapshot_json, file_tree, and concise notes.
-3. Call prepare_test_generation_context.
-4. Use prompt_package so the external LLM writes the tests locally in the developer workspace.
+3. Call scan_test_obligations so changed/uncovered files are remembered from the latest snapshot.
+4. Call prepare_test_generation_context.
+5. Start time tracking with the suggested TEST_CASE_ID.
+6. Use prompt_package so the external LLM writes the tests locally in the developer workspace.
+7. Stop the timer after validation, then call review_test_delivery.
+
+Use scan_test_obligations to remember changed files, files without tests, and files without total test coverage in the RAG/context memory so the same gaps are not asked again. In context_only mode, use the most recent ingested snapshot instead of asking for repository mounts.
 
 Only use discover_test_targets, generate_tests, validate, coverage_gate, or pipeline when execution_mode is server_execution or when the user explicitly wants server-side execution.
 
-If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot. Do not ask for Docker mounts unless the user wants server_execution.
+If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot. Do not ask for Docker mounts unless the user wants server_execution. When a class or file is requested again, preserve previous open work items and prior review findings.
 """.strip()
 
 mcp = FastMCP(
@@ -90,8 +98,24 @@ def _context_only_steps() -> list[dict[str, str]]:
             "why": "refresh or append file/class/method snapshots after code changes",
         },
         {
+            "tool": "scan_test_obligations",
+            "why": "remember changed files, uncovered files and remaining test debt from the latest snapshot",
+        },
+        {
             "tool": "prepare_test_generation_context",
             "why": "produce a compact prompt_package for the external LLM to write tests locally",
+        },
+        {
+            "tool": "start_timer",
+            "why": "track mandatory time spent for the suggested TEST_CASE_ID",
+        },
+        {
+            "tool": "stop_timer",
+            "why": "close the metric record after validation",
+        },
+        {
+            "tool": "review_test_delivery",
+            "why": "check request alignment, standards compliance and remembered obligations",
         },
     ]
 
@@ -101,6 +125,14 @@ def _server_execution_steps() -> list[dict[str, str]]:
         {
             "tool": "route_project",
             "why": "bind the active mounted project on the server",
+        },
+        {
+            "tool": "scan_test_obligations",
+            "why": "remember changed files and uncovered files before generating more tests",
+        },
+        {
+            "tool": "start_timer",
+            "why": "track mandatory time for the test case being generated or updated",
         },
         {
             "tool": "discover_test_targets",
@@ -113,6 +145,14 @@ def _server_execution_steps() -> list[dict[str, str]]:
         {
             "tool": "validate",
             "why": "run build, tests and optional coverage on the server",
+        },
+        {
+            "tool": "stop_timer",
+            "why": "finalize the timing record after validation",
+        },
+        {
+            "tool": "review_test_delivery",
+            "why": "confirm the implementation still matches the request, standards and timing rules",
         },
     ]
 
@@ -198,6 +238,7 @@ async def root_info(_request: Request) -> JSONResponse:
                 "default_remote_sequence": [
                     "route_project",
                     "bootstrap_with_context",
+                    "scan_test_obligations",
                     "prepare_test_generation_context",
                 ],
             },
@@ -1097,10 +1138,12 @@ def _resolve_project_reference(
     normalized = _normalize_fs_path(reference)
     candidate = Path(normalized)
     if candidate.exists():
+        resolved_candidate = str(candidate.resolve())
+        is_virtual = _is_virtual_project_root(resolved_candidate)
         return {
-            "project_root": str(candidate.resolve()),
-            "resolution": "direct",
-            "server_files_available": True,
+            "project_root": resolved_candidate,
+            "resolution": "virtual" if is_virtual else "direct",
+            "server_files_available": not is_virtual,
             "requested_project_root": normalized,
         }
 
@@ -1597,6 +1640,41 @@ def _apply_manual_context(
         )
         upserted_sources.append(entry["source"])
 
+    snapshot_path = _project_snapshot_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    existing_snapshot_state = _read_json_file(
+        snapshot_path,
+        default={
+            "schema_version": 1,
+            "project_manifest": {},
+            "source_snapshot": {"files": []},
+            "file_tree": "",
+            "notes": "",
+        },
+    )
+    merged_snapshot_state = {
+        "schema_version": 1,
+        "project_manifest": (
+            manifest_payload
+            if isinstance(manifest_payload, dict) and manifest_payload
+            else existing_snapshot_state.get("project_manifest", {})
+        ),
+        "source_snapshot": _merge_snapshot_payload(
+            existing_snapshot_state.get("source_snapshot", {"files": []}),
+            snapshot_payload,
+        ),
+        "file_tree": str(file_tree).strip() or str(existing_snapshot_state.get("file_tree", "")).strip(),
+        "notes": str(notes).strip() or str(existing_snapshot_state.get("notes", "")).strip(),
+        "updated_at_utc": _utc_now_iso(),
+    }
+    _write_json_file(snapshot_path, merged_snapshot_state)
+
     memory_index = index_project_memory(
         project_root=project_root,
         include_agents=True,
@@ -1612,9 +1690,299 @@ def _apply_manual_context(
         "updated_profile": merged_profile,
         "updated_variables": merged_variables,
         "upserted_sources": upserted_sources,
+        "snapshot_path": str(snapshot_path),
+        "snapshot_files_tracked": len(_snapshot_payload_files(merged_snapshot_state["source_snapshot"])),
         "memory_index": memory_index,
         "state_dir": str(state_files["state_dir"]),
     }
+
+
+def _tracking_dir(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    state_files = _context_state_files(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    tracking_dir = Path(state_files["state_dir"]) / "tracking"
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    return tracking_dir
+
+
+def _work_items_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "test-work-items.json"
+
+
+def _review_history_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "test-review-history.json"
+
+
+def _test_obligations_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "test-obligations-summary.json"
+
+
+def _project_snapshot_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "latest-project-snapshot.json"
+
+
+def _load_items_file(path: Path, root_key: str = "items") -> dict[str, Any]:
+    payload = _read_json_file(path, default={"schema_version": 1, root_key: []})
+    if not isinstance(payload.get(root_key), list):
+        payload[root_key] = []
+    payload.setdefault("schema_version", 1)
+    return payload
+
+
+def _write_items_file(path: Path, payload: dict[str, Any]) -> None:
+    payload["updated_at_utc"] = _utc_now_iso()
+    _write_json_file(path, payload)
+
+
+def _paths_match(left: str, right: str) -> bool:
+    normalized_left = _normalize_fs_path(left).replace("\\", "/").strip().lower()
+    normalized_right = _normalize_fs_path(right).replace("\\", "/").strip().lower()
+    if not normalized_left or not normalized_right:
+        return False
+    if normalized_left == normalized_right:
+        return True
+    return normalized_left.endswith(f"/{normalized_right}") or normalized_right.endswith(f"/{normalized_left}")
+
+
+def _snapshot_payload_files(snapshot_payload: Any) -> list[dict[str, Any]]:
+    if isinstance(snapshot_payload, dict):
+        files = snapshot_payload.get("files", [])
+    elif isinstance(snapshot_payload, list):
+        files = snapshot_payload
+    else:
+        files = []
+    return [dict(item) for item in files if isinstance(item, dict)]
+
+
+def _merge_snapshot_payload(existing_payload: Any, incoming_payload: Any) -> dict[str, Any]:
+    merged: dict[str, dict[str, Any]] = {}
+
+    for index, item in enumerate(_snapshot_payload_files(existing_payload)):
+        key = str(item.get("path", "") or item.get("name", "") or f"item-{index}").strip().replace("\\", "/")
+        merged[key or f"item-{index}"] = dict(item)
+
+    for index, item in enumerate(_snapshot_payload_files(incoming_payload)):
+        key = str(item.get("path", "") or item.get("name", "") or f"item-{index}").strip().replace("\\", "/")
+        existing = merged.get(key or f"item-{index}", {})
+        merged[key or f"item-{index}"] = {**existing, **item}
+
+    return {
+        "files": list(merged.values()),
+    }
+
+
+def _work_item_key(file_path: str, class_name: str, method_name: str, objective: str) -> str:
+    seed = "|".join(
+        [
+            _normalize_fs_path(file_path).lower(),
+            class_name.strip().lower(),
+            method_name.strip().lower(),
+            objective.strip().lower(),
+        ]
+    )
+    return sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _suggest_test_case_id(class_name: str, method_name: str, file_path: str) -> str:
+    label = class_name.strip() or Path(file_path or "test").stem or "Test"
+    method_part = method_name.strip() or "Scope"
+    base = f"{_slug(label, fallback='test')}-{_slug(method_part, fallback='scope')}"
+    digest = sha1(f"{file_path}|{class_name}|{method_name}".encode("utf-8")).hexdigest()[:6].upper()
+    return f"TST-{base.upper()}-{digest}"
+
+
+def _matching_work_items(
+    items: list[dict[str, Any]],
+    class_name: str = "",
+    method_name: str = "",
+    file_path: str = "",
+) -> list[dict[str, Any]]:
+    normalized_class = class_name.strip().lower()
+    normalized_method = method_name.strip().lower()
+
+    matches: list[dict[str, Any]] = []
+    for item in items:
+        item_file = str(item.get("file_path", "")).strip()
+        item_class = str(item.get("class_name", "")).strip().lower()
+        item_method = str(item.get("method_name", "")).strip().lower()
+        file_match = bool(file_path and _paths_match(item_file, file_path))
+        class_match = bool(normalized_class and item_class == normalized_class)
+        method_match = bool(normalized_method and item_method == normalized_method)
+
+        if normalized_method and method_match:
+            matches.append(item)
+            continue
+        if normalized_class and class_match:
+            matches.append(item)
+            continue
+        if normalized_file and file_match:
+            matches.append(item)
+
+    return matches
+
+
+def _register_test_work_item(
+    project_root: str,
+    objective: str,
+    class_name: str = "",
+    method_name: str = "",
+    file_path: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    path = _work_items_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(path, root_key="items")
+    items = payload["items"]
+    item_key = _work_item_key(file_path=file_path, class_name=class_name, method_name=method_name, objective=objective)
+    existing = next((item for item in items if str(item.get("work_item_id")) == item_key), None)
+    suggested_test_case_id = _suggest_test_case_id(class_name=class_name, method_name=method_name, file_path=file_path or class_name)
+
+    if existing is None:
+        existing = {
+            "work_item_id": item_key,
+            "objective": objective,
+            "class_name": class_name or None,
+            "method_name": method_name or None,
+            "file_path": _normalize_fs_path(file_path) or None,
+            "suggested_test_case_id": suggested_test_case_id,
+            "status": "requested",
+            "request_count": 0,
+            "created_at_utc": _utc_now_iso(),
+        }
+        items.append(existing)
+
+    existing["objective"] = objective
+    existing["class_name"] = class_name or existing.get("class_name")
+    existing["method_name"] = method_name or existing.get("method_name")
+    existing["file_path"] = _normalize_fs_path(file_path) or existing.get("file_path")
+    existing["suggested_test_case_id"] = existing.get("suggested_test_case_id") or suggested_test_case_id
+    existing["status"] = "requested"
+    existing["request_count"] = int(existing.get("request_count", 0)) + 1
+    existing["last_requested_at_utc"] = _utc_now_iso()
+    _write_items_file(path, payload)
+
+    upsert_memory(
+        project_root=project_root,
+        source=f"workitem://{existing['work_item_id']}",
+        content=json.dumps(existing, indent=2, ensure_ascii=True),
+        metadata={"kind": "test_work_item", "status": existing["status"]},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    return existing
+
+
+def _update_work_item_status(
+    project_root: str,
+    work_item_ids: list[str],
+    status: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> list[dict[str, Any]]:
+    path = _work_items_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(path, root_key="items")
+    updated: list[dict[str, Any]] = []
+    for item in payload["items"]:
+        if str(item.get("work_item_id")) not in work_item_ids:
+            continue
+        item["status"] = status
+        item["last_status_update_utc"] = _utc_now_iso()
+        updated.append(item)
+    if updated:
+        _write_items_file(path, payload)
+    return updated
 
 
 @mcp.tool()
@@ -2003,7 +2371,17 @@ def bootstrap_with_context(
             or str(notes).strip()
         ),
         "manual_context": manual_context,
-        "next_recommended_tool": "prepare_test_generation_context",
+        "next_recommended_tool": "scan_test_obligations",
+        "next_actions": [
+            {
+                "tool": "scan_test_obligations",
+                "why": "summarize changed and uncovered files from the latest snapshot before generating tests",
+            },
+            {
+                "tool": "prepare_test_generation_context",
+                "why": "build the compact prompt package for the highest-priority file/class",
+            },
+        ],
     }
 
 
@@ -2057,7 +2435,17 @@ def ingest_project_snapshot(
         "upserted_sources": manual_context["upserted_sources"],
         "memory_index": manual_context["memory_index"],
         "state_dir": manual_context["state_dir"],
-        "next_recommended_tool": "prepare_test_generation_context",
+        "next_recommended_tool": "scan_test_obligations",
+        "next_actions": [
+            {
+                "tool": "scan_test_obligations",
+                "why": "summarize changed and uncovered files from the latest snapshot before generating tests",
+            },
+            {
+                "tool": "prepare_test_generation_context",
+                "why": "build the compact prompt package for the highest-priority file/class",
+            },
+        ],
     }
 
 
@@ -2111,6 +2499,59 @@ def prepare_test_generation_context(
     )
     profile = _read_json_file(state_files["profile_path"], default={})
     variables = _read_json_file(state_files["variables_path"], default={})
+    work_item = _register_test_work_item(
+        project_root=resolved_root,
+        objective=objective,
+        class_name=class_name,
+        method_name=method_name,
+        file_path=file_path,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    work_items_payload = _load_items_file(
+        _work_items_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        root_key="items",
+    )
+    related_open_work_items = [
+        item
+        for item in _matching_work_items(
+            work_items_payload["items"],
+            class_name=class_name,
+            method_name=method_name,
+            file_path=file_path,
+        )
+        if str(item.get("status", "")).lower() not in {"completed", "approved"}
+    ]
+    obligations_summary = _read_json_file(
+        _test_obligations_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        default={},
+    )
+    relevant_obligations: list[dict[str, Any]] = []
+    for item in obligations_summary.get("files", []) if isinstance(obligations_summary.get("files"), list) else []:
+        source_file = str(item.get("source_file", ""))
+        file_matches = bool(file_path and _paths_match(source_file, file_path))
+        class_matches = bool(
+            class_name and class_name.strip().lower() in [str(value).strip().lower() for value in item.get("public_classes", [])]
+        )
+        if file_matches or class_matches:
+            relevant_obligations.append(item)
 
     query_parts = [
         objective,
@@ -2141,8 +2582,10 @@ def prepare_test_generation_context(
         f"Execution mode: {details['execution_mode']}.",
         "Do not ask the MCP server to mount or access the repository when execution mode is context_only.",
         "Use the project profile, retrieved context and packaged testing agents below.",
+        "Remember all prior open obligations for this class/file and do not forget previous requested tests.",
         "",
         f"Objective: {objective}",
+        f"Suggested TEST_CASE_ID: {work_item['suggested_test_case_id']}",
     ]
     if class_name:
         prompt_lines.append(f"Focus class: {class_name}")
@@ -2169,12 +2612,36 @@ def prepare_test_generation_context(
                 ensure_ascii=True,
             ),
             "",
+            "Open obligations / previous requests:",
+            json.dumps(
+                [
+                    {
+                        "work_item_id": item.get("work_item_id"),
+                        "objective": item.get("objective"),
+                        "class_name": item.get("class_name"),
+                        "method_name": item.get("method_name"),
+                        "file_path": item.get("file_path"),
+                        "suggested_test_case_id": item.get("suggested_test_case_id"),
+                        "status": item.get("status"),
+                        "last_requested_at_utc": item.get("last_requested_at_utc"),
+                    }
+                    for item in related_open_work_items
+                ],
+                indent=2,
+                ensure_ascii=True,
+            ),
+            "",
+            "Latest lightweight test debt summary for this target:",
+            json.dumps(relevant_obligations[:5], indent=2, ensure_ascii=True),
+            "",
             "Retrieved context:",
             rag_payload.get("context_compact", ""),
             "",
             "Expected output:",
             "- produce complete test file content ready to be saved locally",
             "- respect xUnit naming and project test standards from the retrieved agent context",
+            "- preserve prior requested coverage for the same class/file when still open",
+            "- use the suggested TEST_CASE_ID for time tracking",
             "- if context is incomplete, say exactly which class/method/file snapshot is missing instead of asking for server mounts",
         ]
     )
@@ -2186,12 +2653,32 @@ def prepare_test_generation_context(
         "objective": objective,
         "query_used": query_text,
         "target_test_project_hint": target_test_project or None,
+        "work_item": work_item,
+        "related_open_work_items": related_open_work_items,
         "prompt_package": "\n".join(prompt_lines).strip(),
         "rag": rag_payload,
         "next_actions": [
             {
+                "step": "scan_test_obligations",
+                "why": "refresh remembered gaps before generating or updating tests for this target",
+            },
+            {
+                "step": "start_timer",
+                "why": "begin mandatory time tracking before writing or updating the test",
+                "suggested_test_case_id": work_item["suggested_test_case_id"],
+            },
+            {
                 "step": "send_prompt_package",
                 "why": "use the prepared context with the external LLM so it writes the test file locally",
+            },
+            {
+                "step": "stop_timer",
+                "why": "finish mandatory time tracking after the test is validated",
+                "suggested_test_case_id": work_item["suggested_test_case_id"],
+            },
+            {
+                "step": "review_test_delivery",
+                "why": "review if the delivery matches the request, open obligations and MCP test standards",
             },
             {
                 "step": "refresh_snapshot_after_changes",
@@ -2199,6 +2686,443 @@ def prepare_test_generation_context(
             },
         ],
         "next_action": "Send prompt_package to the external LLM so it can write the test file locally.",
+    }
+
+
+@mcp.tool()
+def scan_test_obligations(
+    project_root: str | None = None,
+    base_ref: str = "HEAD~1",
+    include_untracked: bool = True,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Lightweight scan of changed and untested source files, using server files when visible or the latest ingested snapshot when running context_only."""
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
+    if details["server_files_available"]:
+        summary = scan_test_debt_lightweight(
+            project_root=resolved_root,
+            base_ref=base_ref,
+            include_untracked=include_untracked,
+        )
+    else:
+        snapshot_path = _project_snapshot_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        snapshot_state = _read_json_file(snapshot_path, default={})
+        snapshot_payload = snapshot_state.get("source_snapshot", {})
+        if not _snapshot_payload_files(snapshot_payload):
+            raise ValueError(
+                "No project snapshot is available for this context. Call bootstrap_with_context or "
+                "ingest_project_snapshot with source_snapshot_json and file_tree before requesting test obligation scanning."
+            )
+        summary = scan_snapshot_test_debt_lightweight(snapshot_payload)
+        summary["project_root"] = resolved_root
+        summary["file_tree_available"] = bool(str(snapshot_state.get("file_tree", "")).strip())
+
+    summary_path = _test_obligations_path(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    _write_json_file(summary_path, summary)
+
+    summary_compact = {
+        "changed_files_needing_tests": summary["changed_files_needing_tests"],
+        "files_without_any_tests": summary["files_without_any_tests"],
+        "files_without_total_test_coverage": summary["files_without_total_test_coverage"],
+        "files_with_total_test_coverage": summary["files_with_total_test_coverage"],
+        "top_open_files": [
+            {
+                "source_file": item["source_file"],
+                "status": item["status"],
+                "missing_methods": item["missing_methods"][:8],
+                "target_test_project": item["target_test_project"],
+            }
+            for item in summary["files"]
+            if item["status"] != "covered"
+        ][:20],
+    }
+    upsert_memory(
+        project_root=resolved_root,
+        source="analysis://test-obligations-summary",
+        content=json.dumps(summary_compact, indent=2, ensure_ascii=True),
+        metadata={"kind": "test_obligations_summary"},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        **details,
+        "scan_mode": summary.get("scan_mode"),
+        "summary_path": str(summary_path),
+        "persisted_to_rag": True,
+        "summary": summary,
+        "message": (
+            f"{summary['files_without_total_test_coverage']} files still appear without total test coverage; "
+            f"{summary['changed_files_needing_tests']} changed files currently need test updates."
+        ),
+        "next_actions": [
+            {
+                "tool": "prepare_test_generation_context",
+                "why": "generate context for the highest-priority uncovered class/file",
+            },
+            {
+                "tool": "review_test_delivery",
+                "why": "confirm each delivery matches the request, open obligations and MCP standards",
+            },
+        ],
+    }
+
+
+@mcp.tool()
+def list_open_test_work_items(
+    project_root: str | None = None,
+    class_name: str = "",
+    method_name: str = "",
+    file_path: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """List remembered open testing obligations so future requests do not forget prior requested tests."""
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(
+        _work_items_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        root_key="items",
+    )
+    items = [
+        item
+        for item in payload["items"]
+        if str(item.get("status", "")).lower() not in {"completed", "approved"}
+    ]
+    if class_name or method_name or file_path:
+        items = _matching_work_items(items, class_name=class_name, method_name=method_name, file_path=file_path)
+    items.sort(key=lambda item: str(item.get("last_requested_at_utc", "")), reverse=True)
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        "open_items_count": len(items),
+        "items": items,
+        "generated_at_utc": _utc_now_iso(),
+    }
+
+
+@mcp.tool()
+def review_test_delivery(
+    objective: str = "",
+    class_name: str = "",
+    method_name: str = "",
+    file_path: str = "",
+    delivered_test_files_json: str = "[]",
+    delivered_test_names_json: str = "[]",
+    test_case_ids_json: str = "[]",
+    notes: str = "",
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Review whether delivered tests match the requested scope, respect MCP standards, preserve previous obligations and include time tracking."""
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    delivered_test_files = _parse_json_payload("delivered_test_files_json", delivered_test_files_json, [])
+    delivered_test_names = _parse_json_payload("delivered_test_names_json", delivered_test_names_json, [])
+    test_case_ids = _parse_json_payload("test_case_ids_json", test_case_ids_json, [])
+    if not isinstance(delivered_test_files, list):
+        raise ValueError("delivered_test_files_json must be a JSON array.")
+    if not isinstance(delivered_test_names, list):
+        raise ValueError("delivered_test_names_json must be a JSON array.")
+    if not isinstance(test_case_ids, list):
+        raise ValueError("test_case_ids_json must be a JSON array.")
+
+    work_items_payload = _load_items_file(
+        _work_items_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        root_key="items",
+    )
+    related_items = _matching_work_items(
+        work_items_payload["items"],
+        class_name=class_name,
+        method_name=method_name,
+        file_path=file_path,
+    )
+    related_items = [item for item in related_items if str(item.get("status", "")).lower() != "completed"]
+    current_work_item_id = _work_item_key(
+        file_path=file_path,
+        class_name=class_name,
+        method_name=method_name,
+        objective=objective,
+    )
+    carry_over_items = [
+        item
+        for item in related_items
+        if str(item.get("work_item_id", "")).strip() != current_work_item_id
+        and str(item.get("status", "")).lower() not in {"approved", "completed"}
+    ]
+
+    timers_payload = _read_json_file(
+        _context_state_files(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )["state_dir"]
+        / "metrics"
+        / "timers.json",
+        default={"timers": {}, "records": []},
+    )
+    records = timers_payload.get("records", []) if isinstance(timers_payload.get("records"), list) else []
+    active_timers = timers_payload.get("timers", {}) if isinstance(timers_payload.get("timers"), dict) else {}
+    recorded_ids = {str(item.get("TEST_CASE_ID", "")).strip() for item in records}
+    provided_ids = {str(item).strip() for item in test_case_ids if str(item).strip()}
+    suggested_ids = {
+        str(item.get("suggested_test_case_id", "")).strip()
+        for item in related_items
+        if str(item.get("suggested_test_case_id", "")).strip()
+    }
+    ids_to_check = sorted(provided_ids or suggested_ids)
+
+    findings: list[dict[str, Any]] = []
+
+    if not delivered_test_files and not delivered_test_names:
+        findings.append(
+            {
+                "severity": "high",
+                "code": "NO_DELIVERY",
+                "message": "No delivered test files or test names were provided for review.",
+            }
+        )
+
+    if carry_over_items:
+        pending_objectives = [
+            str(item.get("objective", "")).strip()
+            for item in carry_over_items
+            if str(item.get("objective", "")).strip()
+        ]
+        if pending_objectives:
+            findings.append(
+                {
+                    "severity": "medium",
+                    "code": "OPEN_OBLIGATIONS",
+                    "message": "There are remembered open testing obligations for this class/file that must be considered in the delivery.",
+                    "objectives": pending_objectives,
+                }
+            )
+
+    if not ids_to_check:
+        findings.append(
+            {
+                "severity": "high",
+                "code": "MISSING_TEST_CASE_ID",
+                "message": "No TEST_CASE_ID was linked to this delivery, so time tracking cannot be verified.",
+            }
+        )
+    else:
+        missing_time = [
+            case_id
+            for case_id in ids_to_check
+            if case_id not in recorded_ids and case_id not in active_timers
+        ]
+        if missing_time:
+            findings.append(
+                {
+                    "severity": "high",
+                    "code": "TIME_TRACKING_MISSING",
+                    "message": "Some reviewed test cases do not have a completed metrics record yet.",
+                    "missing_test_case_ids": missing_time,
+                }
+            )
+        open_timers = [case_id for case_id in ids_to_check if case_id in active_timers and case_id not in recorded_ids]
+        if open_timers:
+            findings.append(
+                {
+                    "severity": "medium",
+                    "code": "TIME_TRACKING_OPEN",
+                    "message": "Time tracking has started but the timer is still open. Stop the timer after validation to finalize the metrics record.",
+                    "open_test_case_ids": open_timers,
+                }
+            )
+
+    obligations_path = _test_obligations_path(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    obligations_summary = _read_json_file(obligations_path, default={})
+    if file_path and isinstance(obligations_summary.get("files"), list):
+        file_matches = [
+            item
+            for item in obligations_summary["files"]
+            if _paths_match(str(item.get("source_file", "")), file_path)
+        ]
+        for item in file_matches:
+            if str(item.get("status", "")) != "covered":
+                findings.append(
+                    {
+                        "severity": "medium",
+                        "code": "TEST_DEBT_OPEN",
+                        "message": "The latest lightweight scan still shows this source file without total test coverage.",
+                        "source_file": item.get("source_file"),
+                        "missing_methods": item.get("missing_methods"),
+                        "scan_status": item.get("status"),
+                    }
+                )
+
+    verdict = "APPROVED" if not any(item["severity"] in {"high", "critical"} for item in findings) else "CHANGES_REQUIRED"
+    updated_items = _update_work_item_status(
+        project_root=resolved_root,
+        work_item_ids=[str(item.get("work_item_id")) for item in related_items if str(item.get("work_item_id", "")).strip()],
+        status="approved" if verdict == "APPROVED" else "changes_required",
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    review_result = {
+        "review_id": sha1(
+            "|".join([objective, class_name, method_name, file_path, _utc_now_iso()]).encode("utf-8")
+        ).hexdigest()[:16],
+        "objective": objective,
+        "class_name": class_name or None,
+        "method_name": method_name or None,
+        "file_path": _normalize_fs_path(file_path) or None,
+        "delivered_test_files": delivered_test_files,
+        "delivered_test_names": delivered_test_names,
+        "test_case_ids": ids_to_check,
+        "carry_over_work_item_ids": [str(item.get("work_item_id")) for item in carry_over_items],
+        "verdict": verdict,
+        "findings": findings,
+        "notes": notes,
+        "reviewed_at_utc": _utc_now_iso(),
+    }
+    review_history_payload = _load_items_file(
+        _review_history_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        root_key="reviews",
+    )
+    review_history_payload["reviews"].append(review_result)
+    _write_items_file(
+        _review_history_path(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+        review_history_payload,
+    )
+    upsert_memory(
+        project_root=resolved_root,
+        source=f"review://{review_result['review_id']}",
+        content=json.dumps(review_result, indent=2, ensure_ascii=True),
+        metadata={"kind": "delivery_review", "verdict": verdict},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        "verdict": verdict,
+        "findings": findings,
+        "related_open_work_items": related_items,
+        "carry_over_work_items": carry_over_items,
+        "updated_work_items": updated_items,
+        "missing_time_tracking": [
+            item["missing_test_case_ids"]
+            for item in findings
+            if item.get("code") == "TIME_TRACKING_MISSING"
+        ],
+        "review": review_result,
+        "next_actions": [
+            {
+                "tool": "stop_timer",
+                "why": "complete missing timing records after validation succeeds",
+            },
+            {
+                "tool": "scan_test_obligations",
+                "why": "refresh test debt memory after the reviewed changes are applied",
+            },
+        ],
     }
 
 
@@ -2741,8 +3665,12 @@ def context_only_workflow_prompt(objective: str = "") -> list[str]:
         "Call these tools in order:",
         "1. route_project",
         "2. bootstrap_with_context or ingest_project_snapshot",
-        "3. prepare_test_generation_context",
-        "Then use prompt_package so the external LLM writes the test file locally in the developer workspace.",
+        "3. scan_test_obligations",
+        "4. prepare_test_generation_context",
+        "5. start_timer",
+        "6. use prompt_package so the external LLM writes the test file locally in the developer workspace",
+        "7. stop_timer",
+        "8. review_test_delivery",
         "If context is incomplete, ask only for the exact missing class, method, file tree, or source snapshot.",
     ]
     if objective.strip():
@@ -2761,10 +3689,12 @@ def server_execution_workflow_prompt(objective: str = "") -> list[str]:
         "The repository is visible to the MCP server, so direct generation and validation tools may be used.",
         "Recommended sequence:",
         "1. route_project",
-        "2. discover_test_targets",
-        "3. generate_tests",
-        "4. validate",
-        "5. coverage_gate or pipeline when appropriate",
+        "2. scan_test_obligations",
+        "3. discover_test_targets",
+        "4. generate_tests",
+        "5. validate",
+        "6. review_test_delivery",
+        "7. coverage_gate or pipeline when appropriate",
     ]
     if objective.strip():
         prompt_lines.extend(["", f"Current objective: {objective.strip()}"])

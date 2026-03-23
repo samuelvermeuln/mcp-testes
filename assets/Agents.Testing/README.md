@@ -35,23 +35,26 @@ Preencha estes campos antes da primeira execucao:
 - `TEST-WRITER-AGENT.md`: agente implementador de testes
 - `TEST-REVIEWER-AGENT.md`: agente revisor tecnico e gatekeeper
 - `TEST-METRICS-AGENT.md`: agente de medicao e economia de tempo
+- `TEST-DEBT-AGENT.md`: agente de varredura leve de backlog e divida de cobertura
 - `TIME-TRACKING-PROTOCOL.md`: protocolo operacional de medicao por teste
 
 ## Fluxo minimo recomendado
 
 1. Executar `ORCHESTRATOR.md`.
-2. O orquestrador cria backlog de testes e delega para os agentes.
-3. O writer implementa testes por lote pequeno.
-4. O reviewer valida qualidade, regressao e flakiness.
-5. O metrics agent registra tempo por teste e consolida economia.
-6. O orquestrador aplica o `TIME-TRACKING-PROTOCOL.md` em todos os testes.
-7. O orquestrador publica relatorio final com gaps e proximos passos.
+2. O orquestrador roda a varredura leve de backlog com `TEST-DEBT-AGENT.md`.
+3. O orquestrador cria backlog de testes e delega para os agentes.
+4. O writer implementa testes por lote pequeno.
+5. O metrics agent inicia e fecha o tempo por `TEST_CASE_ID`.
+6. O reviewer valida qualidade, regressao, aderencia ao pedido e backlog aberto.
+7. O orquestrador aplica o `TIME-TRACKING-PROTOCOL.md` em todos os testes.
+8. O orquestrador publica relatorio final com gaps e proximos passos.
 
 ## Artefatos esperados por rodada
 
 - patch dos testes criados/ajustados
 - lista de comandos executados
 - resultado de build/test
+- backlog de arquivos ainda sem cobertura total
 - log de metricas por teste
 - relatorio consolidado de economia com IA
 

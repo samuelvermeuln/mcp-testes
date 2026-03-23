@@ -39,16 +39,18 @@ Voce deve delegar para:
 2. `TEST-WRITER-AGENT.md`
 3. `TEST-REVIEWER-AGENT.md`
 4. `TEST-METRICS-AGENT.md`
+5. `TEST-DEBT-AGENT.md`
 
 ## Contrato de execucao (obrigatorio)
 
 Siga este protocolo em toda rodada:
 
 1. Levantar evidencias de doc e contexto tecnico.
-2. Propor plano curto com backlog de testes.
-3. Implementar teste por teste (arquivo a arquivo).
-4. Rodar build e testes relevantes.
-5. Publicar report final com lacunas.
+2. Rodar varredura leve de divida de testes e backlog pendente.
+3. Propor plano curto com backlog de testes.
+4. Implementar teste por teste (arquivo a arquivo).
+5. Rodar build e testes relevantes.
+6. Publicar report final com lacunas.
 
 ## Backlog de testes (formato padrao)
 
@@ -69,11 +71,13 @@ Cada teste deve possuir um `TEST_CASE_ID` unico:
 Para cada `TEST_CASE_ID`:
 
 1. Acionar standards agent para validar regra aplicavel.
-2. Acionar writer agent para gerar/ajustar o teste.
-3. Acionar reviewer agent para validar qualidade e riscos.
-4. Executar comando de teste do escopo.
-5. Acionar metrics agent para registrar tempo e economia.
-6. Marcar status: `DONE` ou `FAILED_WITH_REASON`.
+2. Conferir backlog de obrigacoes abertas da mesma classe/arquivo.
+3. Acionar metrics agent para iniciar o tempo do `TEST_CASE_ID`.
+4. Acionar writer agent para gerar/ajustar o teste.
+5. Executar comando de teste do escopo.
+6. Acionar metrics agent para fechar tempo e economia.
+7. Acionar reviewer agent para validar qualidade, riscos, aderencia ao pedido e backlog aberto.
+8. Atualizar memoria/RAG do backlog e marcar status: `DONE` ou `FAILED_WITH_REASON`.
 
 ## Quality gates (nao negociaveis)
 
@@ -87,6 +91,8 @@ Nao permitir merge quando houver qualquer item abaixo:
 - build quebrando
 - teste flakey (passa/falha sem mudanca de codigo)
 - metrica de tempo nao registrada
+- backlog de obrigacoes abertas nao revisado
+- pedido atual nao refletido na entrega final
 
 ## Comandos base de validacao
 

@@ -117,7 +117,10 @@ Contexto e memoria:
 - `bootstrap`
 - `bootstrap_with_context`
 - `ingest_project_snapshot`
+- `scan_test_obligations`
 - `prepare_test_generation_context`
+- `list_open_test_work_items`
+- `review_test_delivery`
 - `get_usage_guidance`
 - `resolve_context`
 - `list_contexts`
@@ -145,10 +148,14 @@ Memoria/RAG (token optimization):
 
 1. `route_project` (passar `intent` e IDs de contexto/dev/workspace)
 2. se estiver em `context_only`, chamar `bootstrap_with_context` ou `ingest_project_snapshot` com manifesto do projeto, file tree e snapshots das classes/metodos relevantes
-3. chamar `prepare_test_generation_context`
-4. usar `prompt_package` retornado na LLM externa para ela escrever os testes localmente no workspace do dev
-5. apos mudancas importantes, chamar `ingest_project_snapshot` ou `rag_index_context` novamente
-6. ao trocar de API, chamar `route_project` novamente com novo `intent`
+3. chamar `scan_test_obligations` para memorizar arquivos alterados, arquivos sem testes e arquivos ainda sem cobertura total
+4. chamar `prepare_test_generation_context`
+5. chamar `start_timer` com o `TEST_CASE_ID` sugerido
+6. usar `prompt_package` retornado na LLM externa para ela escrever os testes localmente no workspace do dev
+7. apos validar, chamar `stop_timer`
+8. chamar `review_test_delivery` para confirmar aderencia ao pedido, backlog aberto e padroes
+9. apos mudancas importantes, chamar `ingest_project_snapshot` ou `rag_index_context` novamente
+10. ao trocar de API, chamar `route_project` novamente com novo `intent`
 
 ## Selecao inteligente de projeto
 
@@ -171,8 +178,17 @@ Fluxo remoto sem mount:
 
 - `route_project`
 - `bootstrap_with_context` com `project_manifest_json` e `source_snapshot_json`
+- `scan_test_obligations` usando o snapshot mais recente
 - `prepare_test_generation_context`
 - a LLM cliente escreve o arquivo de teste no repo local do desenvolvedor
+
+Memoria de backlog e revisao:
+
+- `scan_test_obligations` funciona com repo montado no servidor ou com o ultimo snapshot ingerido em `context_only`
+- o MCP grava no RAG um resumo compacto da divida de testes para nao repetir as mesmas perguntas
+- `prepare_test_generation_context` registra work items por classe/metodo/arquivo e reapresenta obrigacoes abertas
+- `list_open_test_work_items` mostra backlog ainda aberto por contexto
+- `review_test_delivery` revisa a entrega, verifica aderencia ao pedido, backlog anterior e time tracking por `TEST_CASE_ID`
 
 Sinalizacao automatica para a LLM:
 
