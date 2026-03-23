@@ -48,6 +48,7 @@ Default behavior:
 - Prefer context_only workflow when the repository is not visible on the MCP server.
 - Do not ask the developer to mount the repository as the first response.
 - Do not ask broad open-ended questions when the next tool call is already known.
+- If pending_change_alerts are present, tell the external LLM that recent file changes still require test work before unrelated tasks or commits.
 
 When execution_mode is context_only:
 1. Call route_project.
@@ -228,6 +229,7 @@ async def root_info(_request: Request) -> JSONResponse:
             "endpoints": {
                 "health": "/health",
                 "healthz": "/healthz",
+                "workspace_change_hook": "/hooks/workspace-change",
                 "sse": server_settings["sse_path"],
                 "messages": server_settings["message_path"],
                 "streamable_http": server_settings["streamable_http_path"],
@@ -242,6 +244,120 @@ async def root_info(_request: Request) -> JSONResponse:
                     "prepare_test_generation_context",
                 ],
             },
+        }
+    )
+
+
+@mcp.custom_route("/hooks/workspace-change", methods=["POST"], include_in_schema=False)
+async def workspace_change_hook(request: Request) -> JSONResponse:
+    """Receive lightweight local workspace change snapshots from pre-commit hooks or optional background watchers."""
+    hook_settings = _workspace_hook_settings()
+    if not hook_settings["enabled"]:
+        return JSONResponse({"status": "disabled", "message": "workspace hooks are disabled"}, status_code=403)
+
+    shared_secret = str(hook_settings.get("shared_secret", "")).strip()
+    provided_secret = request.headers.get("X-Digital-Solutions-Hook-Secret", "").strip()
+    if shared_secret and provided_secret != shared_secret:
+        return JSONResponse({"status": "error", "message": "Invalid workspace hook secret."}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON payload."}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"status": "error", "message": "Payload must be a JSON object."}, status_code=400)
+
+    project_root = str(payload.get("project_root", "")).strip() or None
+    intent = str(payload.get("intent", "")).strip()
+    developer_id = str(payload.get("developer_id", "")).strip() or None
+    workspace_id = str(payload.get("workspace_id", "")).strip() or None
+    context_id = str(payload.get("context_id", "")).strip() or None
+    context_root = str(payload.get("context_root", "")).strip() or None
+    change_source = str(payload.get("change_source", "")).strip() or "hook"
+    notes = str(payload.get("notes", "")).strip()
+    change_detected_at_utc = str(payload.get("changed_at_utc", "")).strip() or None
+    file_tree = str(payload.get("file_tree", "")).strip()
+
+    project_manifest = payload.get("project_manifest", {})
+    source_snapshot = payload.get("source_snapshot", {})
+    changed_files = payload.get("changed_files", [])
+    if not isinstance(project_manifest, dict):
+        return JSONResponse({"status": "error", "message": "project_manifest must be a JSON object."}, status_code=400)
+    if not isinstance(source_snapshot, (dict, list)):
+        return JSONResponse({"status": "error", "message": "source_snapshot must be a JSON object or array."}, status_code=400)
+    if not isinstance(changed_files, list):
+        return JSONResponse({"status": "error", "message": "changed_files must be a JSON array."}, status_code=400)
+
+    route_payload = route_project(
+        intent=intent,
+        project_root=project_root,
+        ensure_context=True,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    resolved_root = str(route_payload["project_root"])
+    ingest_payload = ingest_project_snapshot(
+        project_root=resolved_root,
+        project_manifest_json=json.dumps(project_manifest, ensure_ascii=True),
+        source_snapshot_json=json.dumps(source_snapshot, ensure_ascii=True),
+        file_tree=file_tree,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    scan_payload = scan_test_obligations(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+    alert = _record_pending_change_alert(
+        project_root=resolved_root,
+        changed_files=[str(item) for item in changed_files if str(item).strip()],
+        scan_summary=scan_payload["summary"],
+        change_source=change_source,
+        change_detected_at_utc=change_detected_at_utc,
+        notes=notes,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+    )
+
+    should_block_commit = int(scan_payload["summary"].get("changed_files_needing_tests", 0)) > 0
+    return JSONResponse(
+        {
+            "status": "ok",
+            "project_root": resolved_root,
+            "execution_mode": route_payload.get("execution_mode"),
+            "ingest": {
+                "upserted_sources_count": ingest_payload.get("upserted_sources_count", 0),
+                "state_dir": ingest_payload.get("state_dir"),
+            },
+            "scan": {
+                "scan_mode": scan_payload.get("scan_mode"),
+                "changed_files_needing_tests": scan_payload["summary"].get("changed_files_needing_tests", 0),
+                "files_without_any_tests": scan_payload["summary"].get("files_without_any_tests", 0),
+                "files_without_total_test_coverage": scan_payload["summary"].get("files_without_total_test_coverage", 0),
+            },
+            "pending_change_alert": alert,
+            "should_block_commit": should_block_commit,
+            "next_actions": [
+                {
+                    "tool": "prepare_test_generation_context",
+                    "why": "generate tests for the recently changed source files before committing",
+                },
+                {
+                    "tool": "review_test_delivery",
+                    "why": "confirm the change was covered and the time record was closed",
+                },
+            ],
         }
     )
 
@@ -340,6 +456,42 @@ def _server_runtime_settings(config_toml_path: str | None = None) -> dict[str, A
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
         ),
+    }
+
+
+def _workspace_hook_settings(config_toml_path: str | None = None) -> dict[str, Any]:
+    settings = _settings_block(config_toml_path=config_toml_path)
+    hook_settings = settings.get("workspace_hooks", {}) if isinstance(settings, dict) else {}
+    enabled = _boolish(
+        os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_HOOKS_ENABLED", "").strip() or hook_settings.get("enabled"),
+        default=True,
+    )
+    shared_secret = (
+        os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_HOOK_SECRET", "").strip()
+        or str(hook_settings.get("shared_secret", "")).strip()
+    )
+    try:
+        alerts_ttl_minutes = int(
+            os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_ALERTS_TTL_MINUTES", "").strip()
+            or str(hook_settings.get("alerts_ttl_minutes", "")).strip()
+            or "1440"
+        )
+    except ValueError:
+        alerts_ttl_minutes = 1440
+    try:
+        max_alerts = int(
+            os.getenv("DIGITAL_SOLUTIONS_WORKSPACE_MAX_ALERTS", "").strip()
+            or str(hook_settings.get("max_alerts", "")).strip()
+            or "100"
+        )
+    except ValueError:
+        max_alerts = 100
+
+    return {
+        "enabled": enabled,
+        "shared_secret": shared_secret,
+        "alerts_ttl_minutes": max(5, alerts_ttl_minutes),
+        "max_alerts": max(10, max_alerts),
     }
 
 
@@ -1790,6 +1942,24 @@ def _project_snapshot_path(
     ) / "latest-project-snapshot.json"
 
 
+def _pending_change_alerts_path(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> Path:
+    return _tracking_dir(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    ) / "pending-change-alerts.json"
+
+
 def _load_items_file(path: Path, root_key: str = "items") -> dict[str, Any]:
     payload = _read_json_file(path, default={"schema_version": 1, root_key: []})
     if not isinstance(payload.get(root_key), list):
@@ -1811,6 +1981,251 @@ def _paths_match(left: str, right: str) -> bool:
     if normalized_left == normalized_right:
         return True
     return normalized_left.endswith(f"/{normalized_right}") or normalized_right.endswith(f"/{normalized_left}")
+
+
+def _parse_utc_timestamp(raw: str) -> datetime | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _age_description(raw: str) -> str:
+    timestamp = _parse_utc_timestamp(raw)
+    if timestamp is None:
+        return "unknown time ago"
+    delta_seconds = max(0, int((datetime.now(timezone.utc) - timestamp).total_seconds()))
+    if delta_seconds < 60:
+        return f"{delta_seconds}s ago"
+    if delta_seconds < 3600:
+        return f"{delta_seconds // 60}m ago"
+    if delta_seconds < 86400:
+        return f"{delta_seconds // 3600}h ago"
+    return f"{delta_seconds // 86400}d ago"
+
+
+def _pending_alert_key(project_root: str, changed_files: list[str], developer_id: str, workspace_id: str) -> str:
+    seed = "|".join(
+        [
+            _normalize_fs_path(project_root).lower(),
+            developer_id.strip().lower(),
+            workspace_id.strip().lower(),
+            *sorted(_normalize_fs_path(path).lower() for path in changed_files if str(path).strip()),
+        ]
+    )
+    return sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _recent_pending_change_alerts(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> list[dict[str, Any]]:
+    hook_settings = _workspace_hook_settings(config_toml_path=config_toml_path)
+    path = _pending_change_alerts_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(path, root_key="alerts")
+    ttl_seconds = int(hook_settings["alerts_ttl_minutes"]) * 60
+    now = datetime.now(timezone.utc)
+    alerts: list[dict[str, Any]] = []
+    for item in payload["alerts"]:
+        if str(item.get("status", "open")).lower() not in {"open", "pending"}:
+            continue
+        last_seen = _parse_utc_timestamp(str(item.get("last_seen_at_utc", ""))) or _parse_utc_timestamp(
+            str(item.get("created_at_utc", ""))
+        )
+        if last_seen is None:
+            continue
+        if (now - last_seen).total_seconds() > ttl_seconds:
+            continue
+        enriched = dict(item)
+        enriched["age_description"] = _age_description(str(item.get("last_seen_at_utc") or item.get("created_at_utc")))
+        alerts.append(enriched)
+    alerts.sort(key=lambda item: str(item.get("last_seen_at_utc", "")), reverse=True)
+    return alerts
+
+
+def _pending_change_alerts_payload(
+    project_root: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    alerts = _recent_pending_change_alerts(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    attention_message = None
+    if alerts:
+        newest = alerts[0]
+        attention_message = str(newest.get("message", "")).strip() or (
+            f"Recent file changes detected {newest.get('age_description', 'recently')} and test work is still pending."
+        )
+    return {
+        "pending_change_alerts_count": len(alerts),
+        "pending_change_alerts": alerts[:10],
+        "attention_required": bool(alerts),
+        "attention_message": attention_message,
+    }
+
+
+def _record_pending_change_alert(
+    project_root: str,
+    changed_files: list[str],
+    scan_summary: dict[str, Any],
+    change_source: str,
+    change_detected_at_utc: str | None = None,
+    notes: str = "",
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    resolved_changed_files = [
+        _normalize_fs_path(path).replace("\\", "/")
+        for path in changed_files
+        if str(path).strip()
+    ]
+    resolved_changed_files = sorted(dict.fromkeys(resolved_changed_files))
+    identity = _resolve_identity(
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    path = _pending_change_alerts_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(path, root_key="alerts")
+    alert_id = _pending_alert_key(
+        project_root=project_root,
+        changed_files=resolved_changed_files,
+        developer_id=identity["developer_id"],
+        workspace_id=identity["workspace_id"],
+    )
+    existing = next((item for item in payload["alerts"] if str(item.get("alert_id")) == alert_id), None)
+    now_iso = _utc_now_iso()
+    created_at = change_detected_at_utc or now_iso
+    summary_files = scan_summary.get("files", []) if isinstance(scan_summary.get("files"), list) else []
+    open_files = [
+        item
+        for item in summary_files
+        if str(item.get("status", "")).lower() != "covered"
+        and any(_paths_match(str(item.get("source_file", "")), changed_file) for changed_file in resolved_changed_files)
+    ]
+    compact_open_files = [
+        {
+            "source_file": item.get("source_file"),
+            "status": item.get("status"),
+            "missing_methods": item.get("missing_methods", [])[:8],
+        }
+        for item in open_files[:10]
+    ]
+    if existing is None:
+        existing = {
+            "alert_id": alert_id,
+            "project_root": project_root,
+            "changed_files": resolved_changed_files,
+            "status": "open",
+            "created_at_utc": created_at,
+            "occurrences": 0,
+        }
+        payload["alerts"].append(existing)
+
+    existing["changed_files"] = resolved_changed_files
+    existing["status"] = "open"
+    existing["change_source"] = change_source
+    existing["notes"] = notes
+    existing["last_seen_at_utc"] = now_iso
+    existing["change_detected_at_utc"] = created_at
+    existing["occurrences"] = int(existing.get("occurrences", 0)) + 1
+    existing["changed_files_needing_tests"] = int(scan_summary.get("changed_files_needing_tests", 0))
+    existing["files_without_total_test_coverage"] = int(scan_summary.get("files_without_total_test_coverage", 0))
+    existing["files_without_any_tests"] = int(scan_summary.get("files_without_any_tests", 0))
+    existing["open_files"] = compact_open_files
+    existing["message"] = (
+        f"{len(resolved_changed_files)} changed file(s) were detected { _age_description(created_at) }; "
+        f"{int(scan_summary.get('changed_files_needing_tests', 0))} changed file(s) still need test work."
+    )
+
+    payload["alerts"] = sorted(
+        payload["alerts"],
+        key=lambda item: str(item.get("last_seen_at_utc", item.get("created_at_utc", ""))),
+        reverse=True,
+    )[: int(_workspace_hook_settings(config_toml_path=config_toml_path)["max_alerts"])]
+    _write_items_file(path, payload)
+
+    upsert_memory(
+        project_root=project_root,
+        source=f"change-alert://{alert_id}",
+        content=json.dumps(existing, indent=2, ensure_ascii=True),
+        metadata={"kind": "pending_change_alert", "status": existing["status"]},
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    return existing
+
+
+def _mark_pending_alerts_status(
+    project_root: str,
+    file_paths: list[str],
+    status: str,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> list[dict[str, Any]]:
+    if not file_paths:
+        return []
+    path = _pending_change_alerts_path(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    payload = _load_items_file(path, root_key="alerts")
+    updated: list[dict[str, Any]] = []
+    for item in payload["alerts"]:
+        changed_files = item.get("changed_files", []) if isinstance(item.get("changed_files"), list) else []
+        if not any(_paths_match(str(candidate), file_path) for candidate in changed_files for file_path in file_paths):
+            continue
+        item["status"] = status
+        item["last_status_update_utc"] = _utc_now_iso()
+        updated.append(item)
+    if updated:
+        _write_items_file(path, payload)
+    return updated
 
 
 def _snapshot_payload_files(snapshot_payload: Any) -> list[dict[str, Any]]:
@@ -2013,11 +2428,20 @@ def detect_project(
     profile = detect_project_profile(resolved_root)
     details = _project_binding_details(identity, resolved_root, requested_project_root=project_root)
     workflow = _workflow_guidance_payload(details["server_files_available"])
+    alerts = _pending_change_alerts_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     return {
         "status": "ok",
         **profile,
         **details,
         **workflow,
+        **alerts,
         "context_only_hint": (
             "This project is currently bound as logical context only. Preferred remote flow: bootstrap_with_context "
             "or ingest_project_snapshot, then prepare_test_generation_context so the external LLM can write tests "
@@ -2196,6 +2620,14 @@ def route_project(
             context_root=context_root,
             config_toml_path=config_toml_path,
         )
+    alerts = _pending_change_alerts_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
 
     return {
         "status": "ok",
@@ -2206,6 +2638,7 @@ def route_project(
         "execution_mode": "server_execution" if binding_variables.get("server_files_available") else "context_only",
         "server_files_available": bool(binding_variables.get("server_files_available")),
         **_workflow_guidance_payload(bool(binding_variables.get("server_files_available"))),
+        **alerts,
         "binding": binding,
         "ensure_context": ensure_context,
         "context_materialized": context_payload,
@@ -2251,6 +2684,14 @@ def get_active_project(
     root = _normalize_fs_path(str(binding.get("project_root", "")))
     exists = bool(root and Path(root).exists())
     details = _project_binding_details(identity, root)
+    alerts = _pending_change_alerts_payload(
+        project_root=root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
     return {
         "status": "ok",
         "found": True,
@@ -2259,6 +2700,7 @@ def get_active_project(
         "project_exists": exists,
         **details,
         **_workflow_guidance_payload(details["server_files_available"]),
+        **alerts,
         "binding": binding,
     }
 
@@ -2552,6 +2994,14 @@ def prepare_test_generation_context(
         )
         if file_matches or class_matches:
             relevant_obligations.append(item)
+    pending_alerts_payload = _pending_change_alerts_payload(
+        project_root=resolved_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
 
     query_parts = [
         objective,
@@ -2634,6 +3084,9 @@ def prepare_test_generation_context(
             "Latest lightweight test debt summary for this target:",
             json.dumps(relevant_obligations[:5], indent=2, ensure_ascii=True),
             "",
+            "Recent pending change alerts:",
+            json.dumps(pending_alerts_payload["pending_change_alerts"][:5], indent=2, ensure_ascii=True),
+            "",
             "Retrieved context:",
             rag_payload.get("context_compact", ""),
             "",
@@ -2655,6 +3108,7 @@ def prepare_test_generation_context(
         "target_test_project_hint": target_test_project or None,
         "work_item": work_item,
         "related_open_work_items": related_open_work_items,
+        **pending_alerts_payload,
         "prompt_package": "\n".join(prompt_lines).strip(),
         "rag": rag_payload,
         "next_actions": [
@@ -2780,6 +3234,23 @@ def scan_test_obligations(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    changed_source_files = [
+        str(item.get("source_file", ""))
+        for item in summary.get("files", [])
+        if bool(item.get("changed")) and str(item.get("source_file", "")).strip()
+    ]
+    updated_alerts = []
+    if int(summary.get("changed_files_needing_tests", 0)) == 0 and changed_source_files:
+        updated_alerts = _mark_pending_alerts_status(
+            project_root=resolved_root,
+            file_paths=changed_source_files,
+            status="addressed",
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
 
     return {
         "status": "ok",
@@ -2788,6 +3259,7 @@ def scan_test_obligations(
         "scan_mode": summary.get("scan_mode"),
         "summary_path": str(summary_path),
         "persisted_to_rag": True,
+        "updated_pending_alerts": updated_alerts,
         "summary": summary,
         "message": (
             f"{summary['files_without_total_test_coverage']} files still appear without total test coverage; "
@@ -3046,6 +3518,20 @@ def review_test_delivery(
         context_root=context_root,
         config_toml_path=config_toml_path,
     )
+    updated_alerts = (
+        _mark_pending_alerts_status(
+            project_root=resolved_root,
+            file_paths=[file_path] if file_path else [],
+            status="addressed" if verdict == "APPROVED" else "open",
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        if file_path
+        else []
+    )
 
     review_result = {
         "review_id": sha1(
@@ -3107,6 +3593,7 @@ def review_test_delivery(
         "related_open_work_items": related_items,
         "carry_over_work_items": carry_over_items,
         "updated_work_items": updated_items,
+        "updated_pending_alerts": updated_alerts,
         "missing_time_tracking": [
             item["missing_test_case_ids"]
             for item in findings
@@ -3585,6 +4072,38 @@ def rag_stats(
 
 
 @mcp.tool()
+def get_pending_change_alerts(
+    project_root: str | None = None,
+    context_id: str | None = None,
+    developer_id: str | None = None,
+    workspace_id: str | None = None,
+    context_root: str | None = None,
+    config_toml_path: str | None = None,
+) -> dict[str, Any]:
+    """Return recent pending change alerts created by the local pre-commit hook or optional background watcher."""
+    resolved_root = _resolve_project_root(
+        project_root=project_root,
+        context_id=context_id,
+        developer_id=developer_id,
+        workspace_id=workspace_id,
+        context_root=context_root,
+        config_toml_path=config_toml_path,
+    )
+    return {
+        "status": "ok",
+        "project_root": resolved_root,
+        **_pending_change_alerts_payload(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        ),
+    }
+
+
+@mcp.tool()
 def get_usage_guidance(
     project_root: str | None = None,
     context_id: str | None = None,
@@ -3624,11 +4143,28 @@ def get_usage_guidance(
         }
 
     workflow = _workflow_guidance_payload(server_files_available)
+    alerts = (
+        _pending_change_alerts_payload(
+            project_root=resolved_root,
+            context_id=context_id,
+            developer_id=developer_id,
+            workspace_id=workspace_id,
+            context_root=context_root,
+            config_toml_path=config_toml_path,
+        )
+        if resolved_root
+        else {
+            "pending_change_alerts_count": 0,
+            "pending_change_alerts": [],
+            "attention_required": False,
+        }
+    )
     return {
         "status": "ok",
         "project_root": resolved_root,
         **details,
         **workflow,
+        **alerts,
         "server_instructions": SERVER_INSTRUCTIONS,
         "do_not_ask_for_mount_first": True,
     }
@@ -3662,6 +4198,7 @@ def context_only_workflow_prompt(objective: str = "") -> list[str]:
         "Use the context-only workflow for this MCP.",
         "Do not ask the developer to mount the repository as the first step.",
         "Do not ask broad open-ended questions.",
+        "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
         "Call these tools in order:",
         "1. route_project",
         "2. bootstrap_with_context or ingest_project_snapshot",
@@ -3687,6 +4224,7 @@ def server_execution_workflow_prompt(objective: str = "") -> list[str]:
     prompt_lines = [
         "Use the server-execution workflow for this MCP.",
         "The repository is visible to the MCP server, so direct generation and validation tools may be used.",
+        "If pending_change_alerts are returned, prioritize those files before unrelated tasks or commits.",
         "Recommended sequence:",
         "1. route_project",
         "2. scan_test_obligations",

@@ -40,14 +40,24 @@ Fluxo recomendado para `context_only`:
 
 - `route_project`
 - `bootstrap_with_context` ou `ingest_project_snapshot` enviando manifesto, file tree e snapshots das classes/metodos relevantes
+- `scan_test_obligations`
 - `prepare_test_generation_context`
 - a LLM cliente escreve/edita os testes localmente no workspace do desenvolvedor
+- `stop_timer`
+- `review_test_delivery`
 
 Sinalizacao para clientes MCP:
 
 - o servidor publica `instructions` com esse fluxo como comportamento padrao
 - o resource `usage://workflow` expõe a mesma orientacao
 - os prompts `context_only_workflow` e `server_execution_workflow` podem ser lidos pelo cliente
+- `pending_change_alerts` sao devolvidos para a LLM quando hooks locais ou watcher opcional detectam alteracoes recentes
+
+Workspace hooks:
+
+- endpoint HTTP: `POST /hooks/workspace-change`
+- configuracao no servidor: `[workspace_hooks]` em `config.toml`
+- se `shared_secret` for definido, o hook local deve enviar o mesmo valor no header `X-Digital-Solutions-Hook-Secret`
 
 ## 3) Docker / Dockploy
 

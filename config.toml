@@ -46,3 +46,13 @@ chunk_chars = 1200
 chunk_overlap_chars = 180
 default_max_chunks = 8
 default_max_chars = 7000
+
+[workspace_hooks]
+# Webhook leve para hooks locais de pre-commit e watcher opcional de mudancas.
+enabled = true
+# Recomendo configurar em producao e reaproveitar no hook-config.toml da API.
+shared_secret = ""
+# Tempo maximo para considerar alertas de mudanca ainda "recentes".
+alerts_ttl_minutes = 1440
+# Quantidade maxima de alertas recentes retidos por contexto.
+max_alerts = 100
